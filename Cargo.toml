@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/mb-types",
+    "crates/mb-control",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

@@ -50,3 +50,15 @@ Anduril Lattice の DSB (Distributed Service Bus) / Lattice Mesh を公開情報
 - Lattice 開発者ドキュメント（node 間の gRPC + Protocol Buffers）
 
 推定に基づく設計であり、Anduril の実装を記述したものではない。
+
+## 実装状況
+
+最初の縦切りとして、I/O を持たない最小制御プレーンを実装済み。
+
+- `mb-types`: `NodeId`、`LinkId`、単調時刻、`Component` 境界
+- `mb-control`: adjacency LSA、LSDB、フラッディング、双方向アサーション、Dijkstra
+- 決定論的な 3 ノード用テストハーネス
+
+```sh
+cargo test --workspace
+```
