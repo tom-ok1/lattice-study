@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package meshbus.control.v1;
+
+// Exchanged before a TCP connection becomes a Link. TLS identity verification
+// will replace the trust placed in this field in the security milestone.
+message LinkHello {
+  bytes node_id = 1;
+  uint32 protocol_version = 2;
+}
+
+message Adjacency {
+  bytes peer = 1;
+  uint32 cost = 2;
+}
+
+// This slice deliberately carries only the fields understood by mb-control.
+message Lsa {
+  bytes origin = 1;
+  uint64 seq = 2;
+  repeated Adjacency adjacencies = 10;
+  uint32 epoch = 20;
+}
+
+// lsa_bytes are retained verbatim while flooding so later signature
+// verification and unknown protobuf fields are not invalidated by re-encoding.
+message SignedLsa {
+  bytes lsa_bytes = 1;
+  bytes signature = 2;
+}

@@ -2,6 +2,9 @@
 members = [
     "crates/mb-types",
     "crates/mb-control",
+    "crates/mb-wire",
+    "crates/mb-transport",
+    "crates/mb-runtime",
 ]
 resolver = "2"
 
@@ -9,6 +12,11 @@ resolver = "2"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.75"
+
+[workspace.dependencies]
+bytes = "=1.10.1"
+prost = "=0.12.6"
+tokio = { version = "=1.37.0", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
