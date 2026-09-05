@@ -28,3 +28,20 @@ message SignedLsa {
   bytes lsa_bytes = 1;
   bytes signature = 2;
 }
+
+// Compact LSDB summary exchanged on link establishment and periodically.
+message Digest {
+  repeated DigestEntry entries = 1;
+}
+
+message DigestEntry {
+  bytes origin = 1;
+  uint32 epoch = 2;
+  uint64 seq = 3;
+}
+
+// Requests the complete signed LSA for origins whose advertised version is
+// newer than the receiver's copy.
+message DigestReq {
+  repeated bytes origins = 1;
+}

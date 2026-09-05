@@ -84,35 +84,49 @@ async fn three_nodes_converge_over_real_loopback_tcp_links() {
         .await
         .expect("C endpoint must bind");
 
-    endpoint_a
-        .connect(b, endpoint_b.local_addr())
-        .await
-        .expect("A-B TCP link must connect");
-    endpoint_b
-        .connect(c, endpoint_c.local_addr())
-        .await
-        .expect("B-C TCP link must connect");
-
-    // Stage the static topology before starting any control plane. This tests
-    // initial flooding without relying on the later anti-entropy milestone.
-    wait_for_links(&endpoint_a, 1).await;
-    wait_for_links(&endpoint_b, 2).await;
-    wait_for_links(&endpoint_c, 1).await;
-
-    let runtime_a = ControlRuntime::spawn(runtime_config(a, [(b, cost(10))]), endpoint_a, events_a)
-        .expect("A runtime must start");
+    let runtime_a = ControlRuntime::spawn(
+        runtime_config(a, [(b, cost(10))]),
+        endpoint_a.clone(),
+        events_a,
+    )
+    .expect("A runtime must start");
     let runtime_b = ControlRuntime::spawn(
         runtime_config(b, [(a, cost(10)), (c, cost(20))]),
-        endpoint_b,
+        endpoint_b.clone(),
         events_b,
     )
     .expect("B runtime must start");
-    let runtime_c = ControlRuntime::spawn(runtime_config(c, [(b, cost(20))]), endpoint_c, events_c)
-        .expect("C runtime must start");
+    let runtime_c = ControlRuntime::spawn(
+        runtime_config(c, [(b, cost(20))]),
+        endpoint_c.clone(),
+        events_c,
+    )
+    .expect("C runtime must start");
 
     let mut snapshots_a = runtime_a.subscribe();
     let mut snapshots_b = runtime_b.subscribe();
     let mut snapshots_c = runtime_c.subscribe();
+
+    endpoint_a
+        .connect(b, endpoint_b.local_addr())
+        .await
+        .expect("A-B TCP link must connect");
+    wait_for_links(&endpoint_a, 1).await;
+    wait_for_links(&endpoint_b, 1).await;
+    let first_pair_converged =
+        |snapshot: &RuntimeSnapshot| snapshot.lsdb_entries == 2 && snapshot.routes.len() == 1;
+    wait_for_snapshot(&mut snapshots_a, first_pair_converged).await;
+    wait_for_snapshot(&mut snapshots_b, first_pair_converged).await;
+
+    // C joins after A and B have already converged. Link-up digest exchange
+    // must transfer A's preexisting LSA across B without a fresh A update.
+    endpoint_b
+        .connect(c, endpoint_c.local_addr())
+        .await
+        .expect("B-C TCP link must connect");
+    wait_for_links(&endpoint_b, 2).await;
+    wait_for_links(&endpoint_c, 1).await;
+
     let converged =
         |snapshot: &RuntimeSnapshot| snapshot.lsdb_entries == 3 && snapshot.routes.len() == 2;
     let snapshot_a = wait_for_snapshot(&mut snapshots_a, converged).await;

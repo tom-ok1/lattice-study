@@ -6,8 +6,10 @@
 
 use mb_types::{Component, LinkId, MonoTime, NodeId};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
+
+pub const DIGEST_INTERVAL_MS: u64 = 10_000;
 
 /// Cost of traversing one directed edge.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -60,6 +62,39 @@ pub struct LsaMessage {
     pub signature: Arc<[u8]>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DigestEntry {
+    pub origin: NodeId,
+    pub epoch: u32,
+    pub seq: u64,
+}
+
+impl DigestEntry {
+    fn version(self) -> (u32, u64) {
+        (self.epoch, self.seq)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EntryRelation {
+    RemoteOnly,
+    RemoteNewer,
+    SameVersion,
+    LocalNewer,
+    LocalOnly,
+}
+
+fn compare_versions(local: Option<(u32, u64)>, remote: Option<(u32, u64)>) -> EntryRelation {
+    match (local, remote) {
+        (None, Some(_)) => EntryRelation::RemoteOnly,
+        (Some(_), None) => EntryRelation::LocalOnly,
+        (Some(local), Some(remote)) if remote > local => EntryRelation::RemoteNewer,
+        (Some(local), Some(remote)) if local > remote => EntryRelation::LocalNewer,
+        (Some(_), Some(_)) => EntryRelation::SameVersion,
+        (None, None) => unreachable!("an origin must exist in at least one digest"),
+    }
+}
+
 pub trait LsaSigner: Send + Sync {
     fn sign(&self, lsa: Lsa) -> LsaMessage;
 }
@@ -91,6 +126,13 @@ impl LsaVerifier for UnsecuredLsaAuth {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlFrame {
     Lsa(LsaMessage),
+    Digest(Vec<DigestEntry>),
+    DigestReq(Vec<NodeId>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ControlTimer {
+    Digest(LinkId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,11 +149,13 @@ pub enum ControlEvent {
         link: LinkId,
         frame: ControlFrame,
     },
+    Timer(ControlTimer),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlAction {
     Send { link: LinkId, frame: ControlFrame },
+    SetTimer { timer: ControlTimer, at: MonoTime },
     PublishRoutes(Arc<RouteTable>),
     PersistSeq(u64),
 }
@@ -245,7 +289,9 @@ impl ControlPlane {
 
         let mut actions = vec![ControlAction::PersistSeq(self.my_seq)];
         actions.extend(self.flood(&message, None));
-        self.recompute_routes(&mut actions);
+        if let Some(action) = self.recompute_routes() {
+            actions.push(action);
+        }
         actions
     }
 
@@ -258,13 +304,34 @@ impl ControlPlane {
         if !self.adjacencies.contains_key(&incoming) || !self.verifier.verify(&message) {
             return Vec::new();
         }
-        if message.lsa.origin == self.me || !self.is_newer(&message.lsa) {
-            return Vec::new();
+        if message.lsa.origin == self.me {
+            return self
+                .lsdb
+                .get(&self.me)
+                .filter(|entry| {
+                    Self::lsa_version(&entry.message.lsa) > Self::lsa_version(&message.lsa)
+                })
+                .map(|entry| self.send_lsa(incoming, &entry.message))
+                .into_iter()
+                .collect();
+        }
+        if !self.is_newer(&message.lsa) {
+            return self
+                .lsdb
+                .get(&message.lsa.origin)
+                .filter(|entry| {
+                    Self::lsa_version(&entry.message.lsa) > Self::lsa_version(&message.lsa)
+                })
+                .map(|entry| self.send_lsa(incoming, &entry.message))
+                .into_iter()
+                .collect();
         }
 
         self.install(message.clone(), now);
         let mut actions = self.flood(&message, Some(incoming));
-        self.recompute_routes(&mut actions);
+        if let Some(action) = self.recompute_routes() {
+            actions.push(action);
+        }
         actions
     }
 
@@ -276,6 +343,109 @@ impl ControlPlane {
                     > (current.message.lsa.epoch, current.message.lsa.seq)
             }
         }
+    }
+
+    fn lsa_version(lsa: &Lsa) -> (u32, u64) {
+        (lsa.epoch, lsa.seq)
+    }
+
+    fn digest(&self) -> Vec<DigestEntry> {
+        self.lsdb
+            .values()
+            .map(|entry| DigestEntry {
+                origin: entry.message.lsa.origin,
+                epoch: entry.message.lsa.epoch,
+                seq: entry.message.lsa.seq,
+            })
+            .collect()
+    }
+
+    fn send_digest(&self, link: LinkId) -> ControlAction {
+        ControlAction::Send {
+            link,
+            frame: ControlFrame::Digest(self.digest()),
+        }
+    }
+
+    fn send_lsa(&self, link: LinkId, message: &LsaMessage) -> ControlAction {
+        ControlAction::Send {
+            link,
+            frame: ControlFrame::Lsa(message.clone()),
+        }
+    }
+
+    fn next_digest_timer(now: MonoTime, link: LinkId) -> ControlAction {
+        ControlAction::SetTimer {
+            timer: ControlTimer::Digest(link),
+            at: MonoTime::from_millis(now.as_millis().saturating_add(DIGEST_INTERVAL_MS)),
+        }
+    }
+
+    fn receive_digest(&self, incoming: LinkId, entries: Vec<DigestEntry>) -> Vec<ControlAction> {
+        if !self.adjacencies.contains_key(&incoming) {
+            return Vec::new();
+        }
+
+        let mut remote = BTreeMap::<NodeId, (u32, u64)>::new();
+        for entry in entries {
+            remote
+                .entry(entry.origin)
+                .and_modify(|version| *version = (*version).max(entry.version()))
+                .or_insert(entry.version());
+        }
+
+        let origins = self
+            .lsdb
+            .keys()
+            .chain(remote.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        let mut requested = Vec::new();
+        let mut actions = Vec::new();
+        for origin in origins {
+            let local = self.lsdb.get(&origin);
+            let local_version = local.map(|entry| Self::lsa_version(&entry.message.lsa));
+            let remote_version = remote.get(&origin).copied();
+
+            match compare_versions(local_version, remote_version) {
+                EntryRelation::RemoteOnly | EntryRelation::RemoteNewer if origin != self.me => {
+                    requested.push(origin);
+                }
+                EntryRelation::LocalOnly | EntryRelation::LocalNewer => {
+                    if let Some(local) = local {
+                        actions.push(self.send_lsa(incoming, &local.message));
+                    }
+                }
+                EntryRelation::SameVersion
+                | EntryRelation::RemoteOnly
+                | EntryRelation::RemoteNewer => {}
+            }
+        }
+        if !requested.is_empty() {
+            actions.push(ControlAction::Send {
+                link: incoming,
+                frame: ControlFrame::DigestReq(requested),
+            });
+        }
+        actions
+    }
+
+    fn receive_digest_req(&self, incoming: LinkId, origins: Vec<NodeId>) -> Vec<ControlAction> {
+        if !self.adjacencies.contains_key(&incoming) {
+            return Vec::new();
+        }
+
+        origins
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|origin| {
+                self.lsdb
+                    .get(&origin)
+                    .map(|entry| self.send_lsa(incoming, &entry.message))
+            })
+            .collect()
     }
 
     fn install(&mut self, message: LsaMessage, now: MonoTime) {
@@ -300,10 +470,17 @@ impl ControlPlane {
             .collect()
     }
 
-    fn recompute_routes(&mut self, actions: &mut Vec<ControlAction>) {
+    fn handle_digest_timer(&self, now: MonoTime, link: LinkId) -> Vec<ControlAction> {
+        if !self.adjacencies.contains_key(&link) {
+            return Vec::new();
+        }
+        vec![self.send_digest(link), Self::next_digest_timer(now, link)]
+    }
+
+    fn recompute_routes(&mut self) -> Option<ControlAction> {
         let routes = self.shortest_paths();
         if routes == self.routes.routes {
-            return;
+            return None;
         }
 
         let table = Arc::new(RouteTable {
@@ -311,7 +488,7 @@ impl ControlPlane {
             routes,
         });
         self.routes = Arc::clone(&table);
-        actions.push(ControlAction::PublishRoutes(table));
+        Some(ControlAction::PublishRoutes(table))
     }
 
     fn shortest_paths(&self) -> BTreeMap<NodeId, Route> {
@@ -420,7 +597,10 @@ impl Component for ControlPlane {
         match event {
             ControlEvent::LinkUp { link, peer, cost } => {
                 self.adjacencies.insert(link, LocalAdjacency { peer, cost });
-                self.originate_lsa(now)
+                let mut actions = self.originate_lsa(now);
+                actions.push(self.send_digest(link));
+                actions.push(Self::next_digest_timer(now, link));
+                actions
             }
             ControlEvent::LinkDown { link } => {
                 if self.adjacencies.remove(&link).is_none() {
@@ -431,7 +611,39 @@ impl Component for ControlPlane {
             }
             ControlEvent::Frame { link, frame } => match frame {
                 ControlFrame::Lsa(message) => self.receive_lsa(now, link, message),
+                ControlFrame::Digest(entries) => self.receive_digest(link, entries),
+                ControlFrame::DigestReq(origins) => self.receive_digest_req(link, origins),
             },
+            ControlEvent::Timer(ControlTimer::Digest(link)) => self.handle_digest_timer(now, link),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compare_versions, EntryRelation};
+
+    #[test]
+    fn digest_entry_relations_are_explicit() {
+        assert_eq!(
+            compare_versions(None, Some((1, 1))),
+            EntryRelation::RemoteOnly
+        );
+        assert_eq!(
+            compare_versions(Some((1, 1)), Some((1, 2))),
+            EntryRelation::RemoteNewer
+        );
+        assert_eq!(
+            compare_versions(Some((1, 1)), Some((1, 1))),
+            EntryRelation::SameVersion
+        );
+        assert_eq!(
+            compare_versions(Some((2, 1)), Some((1, 99))),
+            EntryRelation::LocalNewer
+        );
+        assert_eq!(
+            compare_versions(Some((1, 1)), None),
+            EntryRelation::LocalOnly
+        );
     }
 }

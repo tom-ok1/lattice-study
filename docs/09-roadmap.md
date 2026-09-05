@@ -8,8 +8,8 @@
 **目標**：2 ノードが TCP で繋がり、互いの存在を認識してハートビートを交換する。
 
 - [ ] Cargo workspace、`mb-types`（NodeId、TopicKey、エラー）
-- [ ] `mb-wire`：8 バイトフレームヘッダのコーデック + ラウンドトリップテスト
-- [ ] `mb-transport`：TCP のみ、TLS なし、静的ピア設定のみ
+- [x] `mb-wire`：8 バイトフレームヘッダのコーデック + ラウンドトリップテスト
+- [x] `mb-transport`：TCP のみ、TLS なし、静的ピア設定のみ
 - [ ] `mbd` バイナリ：設定ロード、Link 確立、`LinkHello` 交換、ログ
 - [ ] `Clock` / `Rng` trait と本番実装
 - [ ] `mbtool status` / `mbtool peers`
@@ -20,10 +20,10 @@
 
 **目標**：5 ノードのチェーン／メッシュで LSA が伝播し、経路表が収束する。リンクを切ると再収束する。
 
-- [ ] `mb-control`：LSA 構造、LSDB、フラッディング、重複排除
-- [ ] 双方向アサーションによるグラフ構築
+- [x] `mb-control`：LSA 構造、LSDB、フラッディング、重複排除
+- [x] 双方向アサーションによるグラフ構築
 - [ ] Dijkstra + 経路表、hold timer
-- [ ] Anti-entropy digest 交換
+- [x] Anti-entropy digest 交換
 - [ ] LSA の失効（MaxAge）と再発行
 - [ ] `mbtool routes` / `mbtool lsdb` / `mbtool path`
 - [ ] メトリクス：`mb_lsdb_entries`, `mb_routes_total`, `mb_unreachable_nodes`, `mb_spf_duration_seconds`
