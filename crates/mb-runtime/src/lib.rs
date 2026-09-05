@@ -3,7 +3,8 @@
 use bytes::Bytes;
 use mb_control::{
     Adjacency, ControlAction, ControlEvent, ControlFrame, ControlPlane, ControlTimer, DigestEntry,
-    InvalidLinkCost, LinkCost, Lsa, LsaMessage, RouteTable,
+    InvalidLinkCost, LinkCost, Lsa, LsaMessage, RouteTable, MAX_DIGEST_ENTRIES,
+    MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSA_TTL_SEC,
 };
 use mb_transport::{LinkEvent, TcpEndpoint, TransportError};
 use mb_types::{Component, LinkId, MonoTime, NodeId};
@@ -13,10 +14,147 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeqStoreError(String);
+
+impl SeqStoreError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for SeqStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for SeqStoreError {}
+
+pub trait SeqStore: fmt::Debug + Send + Sync {
+    fn load(&self) -> Result<u64, SeqStoreError>;
+    fn persist(&self, seq: u64) -> Result<(), SeqStoreError>;
+}
+
+#[derive(Debug, Default)]
+pub struct MemorySeqStore {
+    seq: Mutex<u64>,
+}
+
+impl MemorySeqStore {
+    pub fn with_seq(seq: u64) -> Self {
+        Self {
+            seq: Mutex::new(seq),
+        }
+    }
+}
+
+impl SeqStore for MemorySeqStore {
+    fn load(&self) -> Result<u64, SeqStoreError> {
+        self.seq
+            .lock()
+            .map(|seq| *seq)
+            .map_err(|_| SeqStoreError::new("in-memory sequence store lock is poisoned"))
+    }
+
+    fn persist(&self, seq: u64) -> Result<(), SeqStoreError> {
+        let mut stored = self
+            .seq
+            .lock()
+            .map_err(|_| SeqStoreError::new("in-memory sequence store lock is poisoned"))?;
+        if seq < *stored {
+            return Err(SeqStoreError::new(format!(
+                "refusing to move persisted sequence backward from {} to {seq}",
+                *stored
+            )));
+        }
+        *stored = seq;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FileSeqStore {
+    path: PathBuf,
+}
+
+impl FileSeqStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl SeqStore for FileSeqStore {
+    fn load(&self) -> Result<u64, SeqStoreError> {
+        let contents = match fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(SeqStoreError::new(format!(
+                    "failed to read {}: {error}",
+                    self.path.display()
+                )))
+            }
+        };
+        contents.trim().parse::<u64>().map_err(|error| {
+            SeqStoreError::new(format!(
+                "invalid sequence in {}: {error}",
+                self.path.display()
+            ))
+        })
+    }
+
+    fn persist(&self, seq: u64) -> Result<(), SeqStoreError> {
+        let previous = self.load()?;
+        if seq < previous {
+            return Err(SeqStoreError::new(format!(
+                "refusing to move persisted sequence backward from {previous} to {seq}"
+            )));
+        }
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                SeqStoreError::new(format!("failed to create {}: {error}", parent.display()))
+            })?;
+        }
+        let temporary = self.path.with_extension("tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| {
+                SeqStoreError::new(format!("failed to open {}: {error}", temporary.display()))
+            })?;
+        writeln!(file, "{seq}").map_err(|error| {
+            SeqStoreError::new(format!("failed to write {}: {error}", temporary.display()))
+        })?;
+        file.sync_all().map_err(|error| {
+            SeqStoreError::new(format!("failed to sync {}: {error}", temporary.display()))
+        })?;
+        fs::rename(&temporary, &self.path).map_err(|error| {
+            SeqStoreError::new(format!(
+                "failed to replace {}: {error}",
+                self.path.display()
+            ))
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -47,6 +185,14 @@ pub enum RuntimeError {
     Protobuf(prost::DecodeError),
     InvalidNodeIdLength(usize),
     InvalidLinkCost(u32),
+    InvalidLsaTtl(u32),
+    TooManyElements {
+        field: &'static str,
+        count: usize,
+        limit: usize,
+    },
+    SequenceExhausted,
+    SeqStore(SeqStoreError),
     Transport(TransportError),
 }
 
@@ -72,6 +218,14 @@ impl fmt::Display for RuntimeError {
                 write!(f, "control-plane NodeId must be 32 bytes, got {length}")
             }
             Self::InvalidLinkCost(cost) => write!(f, "invalid link cost {cost}"),
+            Self::InvalidLsaTtl(ttl) => write!(f, "invalid LSA ttl_sec {ttl}"),
+            Self::TooManyElements {
+                field,
+                count,
+                limit,
+            } => write!(f, "{field} contains {count} elements, limit is {limit}"),
+            Self::SequenceExhausted => f.write_str("LSA sequence is exhausted"),
+            Self::SeqStore(error) => write!(f, "sequence persistence failed: {error}"),
             Self::Transport(error) => write!(f, "transport operation failed: {error}"),
         }
     }
@@ -81,6 +235,7 @@ impl Error for RuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Protobuf(error) => Some(error),
+            Self::SeqStore(error) => Some(error),
             Self::Transport(error) => Some(error),
             _ => None,
         }
@@ -99,6 +254,12 @@ impl From<TransportError> for RuntimeError {
     }
 }
 
+impl From<SeqStoreError> for RuntimeError {
+    fn from(value: SeqStoreError) -> Self {
+        Self::SeqStore(value)
+    }
+}
+
 /// Handle for observing and stopping one control-plane runtime.
 pub struct ControlRuntime {
     endpoint: TcpEndpoint,
@@ -112,6 +273,20 @@ impl ControlRuntime {
         endpoint: TcpEndpoint,
         events: mpsc::Receiver<LinkEvent>,
     ) -> Result<Self, RuntimeError> {
+        Self::spawn_with_seq_store(
+            config,
+            endpoint,
+            events,
+            Arc::new(MemorySeqStore::default()),
+        )
+    }
+
+    pub fn spawn_with_seq_store(
+        config: RuntimeConfig,
+        endpoint: TcpEndpoint,
+        events: mpsc::Receiver<LinkEvent>,
+        seq_store: Arc<dyn SeqStore>,
+    ) -> Result<Self, RuntimeError> {
         if endpoint.local_node() != config.node_id {
             return Err(RuntimeError::EndpointNodeMismatch {
                 endpoint: endpoint.local_node(),
@@ -119,12 +294,17 @@ impl ControlRuntime {
             });
         }
 
-        let plane = ControlPlane::new_unsecured(config.node_id, config.epoch);
+        let persisted_seq = seq_store.load()?;
+        if persisted_seq == u64::MAX {
+            return Err(RuntimeError::SequenceExhausted);
+        }
+        let plane =
+            ControlPlane::new_unsecured_with_seq(config.node_id, config.epoch, persisted_seq);
         let initial = RuntimeSnapshot {
             node_id: config.node_id,
             lsdb_entries: plane.lsdb_len(),
             routes: plane.route_table(),
-            persisted_seq: 0,
+            persisted_seq,
             peers: BTreeMap::new(),
         };
         let (snapshot_tx, snapshots) = watch::channel(initial);
@@ -135,6 +315,8 @@ impl ControlRuntime {
             driver_endpoint,
             events,
             snapshot_tx,
+            seq_store,
+            persisted_seq,
         ));
         Ok(Self {
             endpoint,
@@ -164,9 +346,10 @@ async fn run_control_loop(
     endpoint: TcpEndpoint,
     mut events: mpsc::Receiver<LinkEvent>,
     snapshots: watch::Sender<RuntimeSnapshot>,
+    seq_store: Arc<dyn SeqStore>,
+    mut persisted_seq: u64,
 ) {
     let started_at = Instant::now();
-    let mut persisted_seq = 0;
     let mut peers = BTreeMap::new();
     let mut timers = BinaryHeap::<Reverse<(u64, u64, ControlTimer)>>::new();
     let mut next_timer_sequence = 0_u64;
@@ -205,7 +388,14 @@ async fn run_control_loop(
                     next_timer_sequence = next_timer_sequence.wrapping_add(1);
                 }
                 ControlAction::PublishRoutes(_) => {}
-                ControlAction::PersistSeq(seq) => persisted_seq = seq,
+                ControlAction::PersistSeq(seq) => {
+                    let store = Arc::clone(&seq_store);
+                    let stored = tokio::task::spawn_blocking(move || store.persist(seq)).await;
+                    if !matches!(stored, Ok(Ok(()))) {
+                        return;
+                    }
+                    persisted_seq = seq;
+                }
             }
         }
 
@@ -291,6 +481,14 @@ async fn translate_link_event(
 fn encode_control_frame(frame: &ControlFrame) -> Result<WireFrame, RuntimeError> {
     match frame {
         ControlFrame::Lsa(message) => {
+            if !(1..=MAX_LSA_TTL_SEC).contains(&message.lsa.ttl_sec) {
+                return Err(RuntimeError::InvalidLsaTtl(message.lsa.ttl_sec));
+            }
+            ensure_limit(
+                "Lsa.adjacencies",
+                message.lsa.adjacencies.len(),
+                MAX_LSA_ADJACENCIES,
+            )?;
             let lsa_bytes = if message.canonical_bytes.is_empty() {
                 encode_lsa(&message.lsa)
             } else {
@@ -303,6 +501,7 @@ fn encode_control_frame(frame: &ControlFrame) -> Result<WireFrame, RuntimeError>
             Ok(WireFrame::control(FrameType::Lsa, signed.encode_to_vec()))
         }
         ControlFrame::Digest(entries) => {
+            ensure_limit("Digest.entries", entries.len(), MAX_DIGEST_ENTRIES)?;
             let digest = proto::Digest {
                 entries: entries
                     .iter()
@@ -319,6 +518,7 @@ fn encode_control_frame(frame: &ControlFrame) -> Result<WireFrame, RuntimeError>
             ))
         }
         ControlFrame::DigestReq(origins) => {
+            ensure_limit("DigestReq.origins", origins.len(), MAX_DIGEST_REQ_ORIGINS)?;
             let request = proto::DigestReq {
                 origins: origins
                     .iter()
@@ -354,6 +554,7 @@ fn decode_control_frame(frame: WireFrame) -> Result<ControlFrame, RuntimeError> 
         }
         FrameType::Digest => {
             let digest = proto::Digest::decode(frame.payload)?;
+            ensure_limit("Digest.entries", digest.entries.len(), MAX_DIGEST_ENTRIES)?;
             let entries = digest
                 .entries
                 .into_iter()
@@ -369,6 +570,11 @@ fn decode_control_frame(frame: WireFrame) -> Result<ControlFrame, RuntimeError> 
         }
         FrameType::DigestReq => {
             let request = proto::DigestReq::decode(frame.payload)?;
+            ensure_limit(
+                "DigestReq.origins",
+                request.origins.len(),
+                MAX_DIGEST_REQ_ORIGINS,
+            )?;
             let origins = request
                 .origins
                 .into_iter()
@@ -387,6 +593,7 @@ fn encode_lsa(lsa: &Lsa) -> Vec<u8> {
     proto::Lsa {
         origin: lsa.origin.as_bytes().to_vec(),
         seq: lsa.seq,
+        ttl_sec: lsa.ttl_sec,
         adjacencies: lsa
             .adjacencies
             .iter()
@@ -402,6 +609,14 @@ fn encode_lsa(lsa: &Lsa) -> Vec<u8> {
 
 fn decode_lsa(wire_lsa: proto::Lsa) -> Result<Lsa, RuntimeError> {
     let origin = decode_node_id(&wire_lsa.origin)?;
+    if !(1..=MAX_LSA_TTL_SEC).contains(&wire_lsa.ttl_sec) {
+        return Err(RuntimeError::InvalidLsaTtl(wire_lsa.ttl_sec));
+    }
+    ensure_limit(
+        "Lsa.adjacencies",
+        wire_lsa.adjacencies.len(),
+        MAX_LSA_ADJACENCIES,
+    )?;
     let adjacencies = wire_lsa
         .adjacencies
         .into_iter()
@@ -418,8 +633,21 @@ fn decode_lsa(wire_lsa: proto::Lsa) -> Result<Lsa, RuntimeError> {
         origin,
         epoch: wire_lsa.epoch,
         seq: wire_lsa.seq,
+        ttl_sec: wire_lsa.ttl_sec,
         adjacencies,
     })
+}
+
+fn ensure_limit(field: &'static str, count: usize, limit: usize) -> Result<(), RuntimeError> {
+    if count > limit {
+        Err(RuntimeError::TooManyElements {
+            field,
+            count,
+            limit,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn decode_node_id(bytes: &[u8]) -> Result<NodeId, RuntimeError> {
@@ -432,6 +660,7 @@ fn decode_node_id(bytes: &[u8]) -> Result<NodeId, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn node(value: u8) -> NodeId {
         let mut bytes = [0; 32];
@@ -445,6 +674,7 @@ mod tests {
             origin: node(1),
             epoch: 7,
             seq: 42,
+            ttl_sec: 300,
             adjacencies: vec![Adjacency {
                 peer: node(2),
                 cost: LinkCost::new(9).expect("cost must be valid"),
@@ -495,6 +725,7 @@ mod tests {
         let invalid = proto::Lsa {
             origin: vec![0; 31],
             seq: 1,
+            ttl_sec: 300,
             adjacencies: Vec::new(),
             epoch: 1,
         };
@@ -507,6 +738,107 @@ mod tests {
         assert!(matches!(
             decode_control_frame(frame),
             Err(RuntimeError::InvalidNodeIdLength(31))
+        ));
+    }
+
+    #[test]
+    fn control_collection_limits_are_enforced_on_encode_and_decode() {
+        let oversized_digest = ControlFrame::Digest(vec![
+            DigestEntry {
+                origin: node(1),
+                epoch: 1,
+                seq: 1,
+            };
+            MAX_DIGEST_ENTRIES + 1
+        ]);
+        assert!(matches!(
+            encode_control_frame(&oversized_digest),
+            Err(RuntimeError::TooManyElements {
+                field: "Digest.entries",
+                ..
+            })
+        ));
+
+        let digest = proto::Digest {
+            entries: vec![
+                proto::DigestEntry {
+                    origin: node(1).as_bytes().to_vec(),
+                    epoch: 1,
+                    seq: 1,
+                };
+                MAX_DIGEST_ENTRIES + 1
+            ],
+        };
+        let wire = WireFrame::control(FrameType::Digest, digest.encode_to_vec());
+        assert!(matches!(
+            decode_control_frame(wire),
+            Err(RuntimeError::TooManyElements {
+                field: "Digest.entries",
+                ..
+            })
+        ));
+
+        let invalid_ttl = ControlFrame::Lsa(LsaMessage {
+            lsa: Lsa {
+                origin: node(1),
+                epoch: 1,
+                seq: 1,
+                ttl_sec: 0,
+                adjacencies: Vec::new(),
+            },
+            canonical_bytes: Arc::from([]),
+            signature: Arc::from([]),
+        });
+        assert!(matches!(
+            encode_control_frame(&invalid_ttl),
+            Err(RuntimeError::InvalidLsaTtl(0))
+        ));
+    }
+
+    #[test]
+    fn file_sequence_store_round_trips_monotonically() {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "mb-runtime-seq-test-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = directory.join("seq");
+        let store = FileSeqStore::new(&path);
+
+        assert_eq!(store.load().expect("missing store starts at zero"), 0);
+        store.persist(41).expect("sequence must persist");
+        assert_eq!(
+            FileSeqStore::new(&path)
+                .load()
+                .expect("sequence must reload"),
+            41
+        );
+        assert!(store.persist(40).is_err());
+        assert_eq!(
+            store.load().expect("failed write must not change value"),
+            41
+        );
+
+        fs::remove_dir_all(&directory).expect("temporary sequence directory must be removable");
+    }
+
+    #[test]
+    fn restart_continues_immediately_after_the_saved_sequence() {
+        let saved = 41;
+        let mut plane = ControlPlane::new_unsecured_with_seq(node(1), 1, saved);
+        let actions = plane.handle(
+            MonoTime::ZERO,
+            ControlEvent::LinkUp {
+                link: LinkId::new(1),
+                peer: node(2),
+                cost: LinkCost::new(1).expect("cost is valid"),
+            },
+        );
+
+        assert!(matches!(
+            actions.first(),
+            Some(ControlAction::PersistSeq(seq)) if *seq == saved + 1
         ));
     }
 }

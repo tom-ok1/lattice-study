@@ -56,12 +56,12 @@ Anduril Lattice の DSB (Distributed Service Bus) / Lattice Mesh を公開情報
 最初の縦切りとして、I/O を持たない最小制御プレーンと、それを実 TCP から駆動する runtime を実装済み。
 
 - `mb-types`: `NodeId`、`LinkId`、単調時刻、`Component` 境界
-- `mb-control`: adjacency LSA、LSDB、フラッディング、Anti-Entropy、双方向アサーション、Dijkstra
+- `mb-control`: TTL 付き adjacency LSA、LSDB、フラッディング、Anti-Entropy、失効・再発行、双方向アサーション、Dijkstra
 - 決定論的な 3 ノード用テストハーネス
 - `mb-wire`: LSA/Digest protobuf、固定 8 byte header、1 MiB 上限、incremental decoder
 - `mb-transport`: TLS なし・静的ピア限定の TCP adapter
-- `mb-runtime`: TCP と control の Event/Action、単調時刻 Timer を接続する Tokio glue
-- loopback TCP 上の動的な 3 ノード参加・LSA・経路収束テスト
+- `mb-runtime`: TCP と control の Event/Action、単調時刻 Timer、再起動をまたぐ seq 永続化を接続する Tokio glue
+- 仮想時刻による LSA 再発行・失効・compact tombstone テストと、loopback TCP 上の動的な 3 ノード参加・経路収束テスト
 
 ```sh
 cargo test --workspace

@@ -10,6 +10,12 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
 
 pub const DIGEST_INTERVAL_MS: u64 = 10_000;
+pub const DEFAULT_LSA_TTL_SEC: u32 = 300;
+pub const MAX_LSA_TTL_SEC: u32 = 3_600;
+pub const MAX_LSDB_ENTRIES: usize = 1_000;
+pub const MAX_LSA_ADJACENCIES: usize = 256;
+pub const MAX_DIGEST_ENTRIES: usize = MAX_LSDB_ENTRIES;
+pub const MAX_DIGEST_REQ_ORIGINS: usize = MAX_LSDB_ENTRIES;
 
 /// Cost of traversing one directed edge.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -40,13 +46,14 @@ pub struct Adjacency {
 
 /// Minimal LSA used by the first control-plane slice.
 ///
-/// Service, topic, address, and expiry fields can be added without changing
-/// the event/action boundary around the control plane.
+/// Service, topic, and address fields can be added without changing the
+/// event/action boundary around the control plane.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lsa {
     pub origin: NodeId,
     pub epoch: u32,
     pub seq: u64,
+    pub ttl_sec: u32,
     pub adjacencies: Vec<Adjacency>,
 }
 
@@ -133,6 +140,15 @@ pub enum ControlFrame {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ControlTimer {
     Digest(LinkId),
+    LsaRefresh {
+        epoch: u32,
+        seq: u64,
+    },
+    LsaExpire {
+        origin: NodeId,
+        epoch: u32,
+        seq: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -193,8 +209,30 @@ impl RouteTable {
 
 #[derive(Clone, Debug)]
 struct LsdbEntry {
+    version: (u32, u64),
+    state: LsdbEntryState,
+}
+
+#[derive(Clone, Debug)]
+enum LsdbEntryState {
+    Active(ActiveLsa),
+    Tombstone,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveLsa {
     message: LsaMessage,
     received_at: MonoTime,
+    expires_at: MonoTime,
+}
+
+impl LsdbEntry {
+    fn active(&self) -> Option<&ActiveLsa> {
+        match &self.state {
+            LsdbEntryState::Active(active) => Some(active),
+            LsdbEntryState::Tombstone => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -216,9 +254,16 @@ pub struct ControlPlane {
 
 impl ControlPlane {
     pub fn new_unsecured(me: NodeId, epoch: u32) -> Self {
-        Self::with_auth(
+        Self::new_unsecured_with_seq(me, epoch, 0)
+    }
+
+    /// Constructs a control plane whose next locally originated LSA will have
+    /// a sequence number greater than `last_seq`.
+    pub fn new_unsecured_with_seq(me: NodeId, epoch: u32, last_seq: u64) -> Self {
+        Self::with_auth_and_seq(
             me,
             epoch,
+            last_seq,
             Box::<UnsecuredLsaAuth>::default(),
             Box::<UnsecuredLsaAuth>::default(),
         )
@@ -230,10 +275,20 @@ impl ControlPlane {
         signer: Box<dyn LsaSigner>,
         verifier: Box<dyn LsaVerifier>,
     ) -> Self {
+        Self::with_auth_and_seq(me, epoch, 0, signer, verifier)
+    }
+
+    pub fn with_auth_and_seq(
+        me: NodeId,
+        epoch: u32,
+        last_seq: u64,
+        signer: Box<dyn LsaSigner>,
+        verifier: Box<dyn LsaVerifier>,
+    ) -> Self {
         Self {
             me,
             epoch,
-            my_seq: 0,
+            my_seq: last_seq,
             adjacencies: BTreeMap::new(),
             lsdb: BTreeMap::new(),
             routes: Arc::new(RouteTable::default()),
@@ -255,11 +310,23 @@ impl ControlPlane {
     }
 
     pub fn lsa(&self, origin: &NodeId) -> Option<&Lsa> {
-        self.lsdb.get(origin).map(|entry| &entry.message.lsa)
+        self.lsdb
+            .get(origin)
+            .and_then(LsdbEntry::active)
+            .map(|active| &active.message.lsa)
     }
 
     pub fn lsa_received_at(&self, origin: &NodeId) -> Option<MonoTime> {
-        self.lsdb.get(origin).map(|entry| entry.received_at)
+        self.lsdb
+            .get(origin)
+            .and_then(LsdbEntry::active)
+            .map(|active| active.received_at)
+    }
+
+    pub fn lsa_is_expired(&self, origin: &NodeId) -> Option<bool> {
+        self.lsdb
+            .get(origin)
+            .map(|entry| matches!(entry.state, LsdbEntryState::Tombstone))
     }
 
     fn originate_lsa(&mut self, now: MonoTime) -> Vec<ControlAction> {
@@ -279,19 +346,24 @@ impl ControlPlane {
             origin: self.me,
             epoch: self.epoch,
             seq: self.my_seq,
+            ttl_sec: DEFAULT_LSA_TTL_SEC,
             adjacencies: best_by_peer
                 .into_iter()
                 .map(|(peer, cost)| Adjacency { peer, cost })
                 .collect(),
         };
         let message = self.signer.sign(lsa);
-        self.install(message.clone(), now);
+        let expiry = self
+            .install(message.clone(), now)
+            .expect("local LSA must fit in the reserved LSDB entry");
 
         let mut actions = vec![ControlAction::PersistSeq(self.my_seq)];
         actions.extend(self.flood(&message, None));
         if let Some(action) = self.recompute_routes() {
             actions.push(action);
         }
+        actions.push(expiry);
+        actions.push(Self::next_refresh_timer(now, &message.lsa));
         actions
     }
 
@@ -301,17 +373,19 @@ impl ControlPlane {
         incoming: LinkId,
         message: LsaMessage,
     ) -> Vec<ControlAction> {
-        if !self.adjacencies.contains_key(&incoming) || !self.verifier.verify(&message) {
+        if !self.adjacencies.contains_key(&incoming)
+            || !Self::valid_lsa(&message.lsa)
+            || !self.verifier.verify(&message)
+        {
             return Vec::new();
         }
         if message.lsa.origin == self.me {
             return self
                 .lsdb
                 .get(&self.me)
-                .filter(|entry| {
-                    Self::lsa_version(&entry.message.lsa) > Self::lsa_version(&message.lsa)
-                })
-                .map(|entry| self.send_lsa(incoming, &entry.message))
+                .filter(|entry| entry.version > Self::lsa_version(&message.lsa))
+                .and_then(LsdbEntry::active)
+                .map(|active| self.send_lsa(incoming, &active.message))
                 .into_iter()
                 .collect();
         }
@@ -319,29 +393,32 @@ impl ControlPlane {
             return self
                 .lsdb
                 .get(&message.lsa.origin)
-                .filter(|entry| {
-                    Self::lsa_version(&entry.message.lsa) > Self::lsa_version(&message.lsa)
-                })
-                .map(|entry| self.send_lsa(incoming, &entry.message))
+                .filter(|entry| entry.version > Self::lsa_version(&message.lsa))
+                .and_then(LsdbEntry::active)
+                .map(|active| self.send_lsa(incoming, &active.message))
                 .into_iter()
                 .collect();
         }
 
-        self.install(message.clone(), now);
+        let Some(expiry) = self.install(message.clone(), now) else {
+            return Vec::new();
+        };
         let mut actions = self.flood(&message, Some(incoming));
         if let Some(action) = self.recompute_routes() {
             actions.push(action);
         }
+        actions.push(expiry);
         actions
+    }
+
+    fn valid_lsa(lsa: &Lsa) -> bool {
+        (1..=MAX_LSA_TTL_SEC).contains(&lsa.ttl_sec) && lsa.adjacencies.len() <= MAX_LSA_ADJACENCIES
     }
 
     fn is_newer(&self, candidate: &Lsa) -> bool {
         match self.lsdb.get(&candidate.origin) {
             None => true,
-            Some(current) => {
-                (candidate.epoch, candidate.seq)
-                    > (current.message.lsa.epoch, current.message.lsa.seq)
-            }
+            Some(current) => (candidate.epoch, candidate.seq) > current.version,
         }
     }
 
@@ -351,11 +428,11 @@ impl ControlPlane {
 
     fn digest(&self) -> Vec<DigestEntry> {
         self.lsdb
-            .values()
-            .map(|entry| DigestEntry {
-                origin: entry.message.lsa.origin,
-                epoch: entry.message.lsa.epoch,
-                seq: entry.message.lsa.seq,
+            .iter()
+            .map(|(origin, entry)| DigestEntry {
+                origin: *origin,
+                epoch: entry.version.0,
+                seq: entry.version.1,
             })
             .collect()
     }
@@ -381,8 +458,19 @@ impl ControlPlane {
         }
     }
 
+    fn next_refresh_timer(now: MonoTime, lsa: &Lsa) -> ControlAction {
+        let refresh_ms = Self::ttl_ms(lsa) / 5;
+        ControlAction::SetTimer {
+            timer: ControlTimer::LsaRefresh {
+                epoch: lsa.epoch,
+                seq: lsa.seq,
+            },
+            at: MonoTime::from_millis(now.as_millis().saturating_add(refresh_ms)),
+        }
+    }
+
     fn receive_digest(&self, incoming: LinkId, entries: Vec<DigestEntry>) -> Vec<ControlAction> {
-        if !self.adjacencies.contains_key(&incoming) {
+        if !self.adjacencies.contains_key(&incoming) || entries.len() > MAX_DIGEST_ENTRIES {
             return Vec::new();
         }
 
@@ -405,7 +493,7 @@ impl ControlPlane {
         let mut actions = Vec::new();
         for origin in origins {
             let local = self.lsdb.get(&origin);
-            let local_version = local.map(|entry| Self::lsa_version(&entry.message.lsa));
+            let local_version = local.map(|entry| entry.version);
             let remote_version = remote.get(&origin).copied();
 
             match compare_versions(local_version, remote_version) {
@@ -413,8 +501,8 @@ impl ControlPlane {
                     requested.push(origin);
                 }
                 EntryRelation::LocalOnly | EntryRelation::LocalNewer => {
-                    if let Some(local) = local {
-                        actions.push(self.send_lsa(incoming, &local.message));
+                    if let Some(active) = local.and_then(LsdbEntry::active) {
+                        actions.push(self.send_lsa(incoming, &active.message));
                     }
                 }
                 EntryRelation::SameVersion
@@ -432,7 +520,7 @@ impl ControlPlane {
     }
 
     fn receive_digest_req(&self, incoming: LinkId, origins: Vec<NodeId>) -> Vec<ControlAction> {
-        if !self.adjacencies.contains_key(&incoming) {
+        if !self.adjacencies.contains_key(&incoming) || origins.len() > MAX_DIGEST_REQ_ORIGINS {
             return Vec::new();
         }
 
@@ -443,19 +531,39 @@ impl ControlPlane {
             .filter_map(|origin| {
                 self.lsdb
                     .get(&origin)
-                    .map(|entry| self.send_lsa(incoming, &entry.message))
+                    .and_then(LsdbEntry::active)
+                    .map(|active| self.send_lsa(incoming, &active.message))
             })
             .collect()
     }
 
-    fn install(&mut self, message: LsaMessage, now: MonoTime) {
+    fn install(&mut self, message: LsaMessage, now: MonoTime) -> Option<ControlAction> {
+        if !self.lsdb.contains_key(&message.lsa.origin) && self.lsdb.len() >= MAX_LSDB_ENTRIES {
+            return None;
+        }
+        let expires_at =
+            MonoTime::from_millis(now.as_millis().saturating_add(Self::ttl_ms(&message.lsa)));
+        let origin = message.lsa.origin;
+        let (epoch, seq) = Self::lsa_version(&message.lsa);
         self.lsdb.insert(
-            message.lsa.origin,
+            origin,
             LsdbEntry {
-                message,
-                received_at: now,
+                version: (epoch, seq),
+                state: LsdbEntryState::Active(ActiveLsa {
+                    message,
+                    received_at: now,
+                    expires_at,
+                }),
             },
         );
+        Some(ControlAction::SetTimer {
+            timer: ControlTimer::LsaExpire { origin, epoch, seq },
+            at: expires_at,
+        })
+    }
+
+    fn ttl_ms(lsa: &Lsa) -> u64 {
+        u64::from(lsa.ttl_sec).saturating_mul(1_000)
     }
 
     fn flood(&self, message: &LsaMessage, except: Option<LinkId>) -> Vec<ControlAction> {
@@ -475,6 +583,51 @@ impl ControlPlane {
             return Vec::new();
         }
         vec![self.send_digest(link), Self::next_digest_timer(now, link)]
+    }
+
+    fn handle_refresh_timer(&mut self, now: MonoTime, epoch: u32, seq: u64) -> Vec<ControlAction> {
+        let is_current = self
+            .lsdb
+            .get(&self.me)
+            .is_some_and(|entry| entry.version == (epoch, seq) && entry.active().is_some());
+        if is_current {
+            self.originate_lsa(now)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn handle_expire_timer(
+        &mut self,
+        now: MonoTime,
+        origin: NodeId,
+        epoch: u32,
+        seq: u64,
+    ) -> Vec<ControlAction> {
+        let Some(entry) = self.lsdb.get(&origin) else {
+            return Vec::new();
+        };
+        if entry.version != (epoch, seq) {
+            return Vec::new();
+        }
+        let Some(active) = entry.active() else {
+            return Vec::new();
+        };
+        // The Tokio runtime normally delivers this timer only at or after its
+        // deadline. Rescheduling is defensive for alternate drivers,
+        // simulators, or manually injected early timer events.
+        if now < active.expires_at {
+            return vec![ControlAction::SetTimer {
+                timer: ControlTimer::LsaExpire { origin, epoch, seq },
+                at: active.expires_at,
+            }];
+        }
+
+        self.lsdb
+            .get_mut(&origin)
+            .expect("entry checked above")
+            .state = LsdbEntryState::Tombstone;
+        self.recompute_routes().into_iter().collect()
     }
 
     fn recompute_routes(&mut self) -> Option<ControlAction> {
@@ -558,19 +711,24 @@ impl ControlPlane {
     fn bidirectional_graph(&self) -> BTreeMap<NodeId, Vec<Adjacency>> {
         let mut graph = BTreeMap::new();
         for (origin, entry) in &self.lsdb {
-            let accepted = entry
+            let Some(active) = entry.active() else {
+                continue;
+            };
+            let accepted = active
                 .message
                 .lsa
                 .adjacencies
                 .iter()
                 .filter(|edge| {
                     self.lsdb.get(&edge.peer).is_some_and(|peer_entry| {
-                        peer_entry
-                            .message
-                            .lsa
-                            .adjacencies
-                            .iter()
-                            .any(|reverse| reverse.peer == *origin)
+                        peer_entry.active().is_some_and(|peer_active| {
+                            peer_active
+                                .message
+                                .lsa
+                                .adjacencies
+                                .iter()
+                                .any(|reverse| reverse.peer == *origin)
+                        })
                     })
                 })
                 .cloned()
@@ -614,7 +772,15 @@ impl Component for ControlPlane {
                 ControlFrame::Digest(entries) => self.receive_digest(link, entries),
                 ControlFrame::DigestReq(origins) => self.receive_digest_req(link, origins),
             },
-            ControlEvent::Timer(ControlTimer::Digest(link)) => self.handle_digest_timer(now, link),
+            ControlEvent::Timer(timer) => match timer {
+                ControlTimer::Digest(link) => self.handle_digest_timer(now, link),
+                ControlTimer::LsaRefresh { epoch, seq } => {
+                    self.handle_refresh_timer(now, epoch, seq)
+                }
+                ControlTimer::LsaExpire { origin, epoch, seq } => {
+                    self.handle_expire_timer(now, origin, epoch, seq)
+                }
+            },
         }
     }
 }

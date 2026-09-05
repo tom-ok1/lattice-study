@@ -1,6 +1,7 @@
 use mb_control::{
     Adjacency, ControlAction, ControlEvent, ControlFrame, ControlPlane, ControlTimer, LinkCost,
-    Lsa, LsaMessage, DIGEST_INTERVAL_MS,
+    Lsa, LsaMessage, DEFAULT_LSA_TTL_SEC, DIGEST_INTERVAL_MS, MAX_DIGEST_ENTRIES,
+    MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSDB_ENTRIES,
 };
 use mb_types::{Component, LinkId, MonoTime, NodeId};
 use std::collections::{BTreeMap, VecDeque};
@@ -200,6 +201,7 @@ fn one_sided_adjacency_is_never_used_for_routing() {
             origin: attacker,
             epoch: 1,
             seq: 1,
+            ttl_sec: 300,
             adjacencies: vec![Adjacency {
                 peer: ids[0],
                 cost: cost(1),
@@ -367,6 +369,7 @@ fn newer_self_origin_lsa_is_not_reflected_back_to_the_peer() {
                     origin: me,
                     epoch: 1,
                     seq: 2,
+                    ttl_sec: 300,
                     adjacencies: Vec::new(),
                 },
                 canonical_bytes: Arc::from([]),
@@ -390,4 +393,385 @@ fn newer_self_origin_lsa_is_not_reflected_back_to_the_peer() {
         },
     );
     assert!(digest_actions.is_empty());
+}
+
+#[test]
+fn local_lsa_is_refreshed_before_it_expires() {
+    let me = node(1);
+    let link = LinkId::new(1);
+    let mut plane = ControlPlane::new_unsecured(me, 1);
+    let initial = plane.handle(
+        MonoTime::ZERO,
+        ControlEvent::LinkUp {
+            link,
+            peer: node(2),
+            cost: cost(10),
+        },
+    );
+    let refresh_at = u64::from(DEFAULT_LSA_TTL_SEC) * 1_000 / 5;
+    assert!(initial.iter().any(|action| {
+        matches!(
+            action,
+            ControlAction::SetTimer {
+                timer: ControlTimer::LsaRefresh { epoch: 1, seq: 1 },
+                at,
+            } if at.as_millis() == refresh_at
+        )
+    }));
+
+    let refreshed = plane.handle(
+        MonoTime::from_millis(refresh_at),
+        ControlEvent::Timer(ControlTimer::LsaRefresh { epoch: 1, seq: 1 }),
+    );
+
+    assert_eq!(plane.lsa(&me).map(|lsa| lsa.seq), Some(2));
+    assert!(matches!(
+        refreshed.first(),
+        Some(ControlAction::PersistSeq(2))
+    ));
+    assert!(refreshed.iter().any(|action| {
+        matches!(
+            action,
+            ControlAction::SetTimer {
+                timer: ControlTimer::LsaRefresh { epoch: 1, seq: 2 },
+                at,
+            } if at.as_millis() == refresh_at * 2
+        )
+    }));
+}
+
+#[test]
+fn remote_lsa_becomes_a_permanent_compact_tombstone() {
+    let me = node(1);
+    let peer = node(2);
+    let link = LinkId::new(1);
+    let mut plane = ControlPlane::new_unsecured(me, 1);
+    plane.handle(
+        MonoTime::ZERO,
+        ControlEvent::LinkUp {
+            link,
+            peer,
+            cost: cost(10),
+        },
+    );
+    let received_at = MonoTime::from_millis(10);
+    let peer_lsa = Lsa {
+        origin: peer,
+        epoch: 1,
+        seq: 7,
+        ttl_sec: DEFAULT_LSA_TTL_SEC,
+        adjacencies: vec![Adjacency {
+            peer: me,
+            cost: cost(10),
+        }],
+    };
+    let canonical_bytes: Arc<[u8]> = Arc::from([1_u8, 2, 3]);
+    plane.handle(
+        received_at,
+        ControlEvent::Frame {
+            link,
+            frame: ControlFrame::Lsa(LsaMessage {
+                lsa: peer_lsa.clone(),
+                canonical_bytes: Arc::clone(&canonical_bytes),
+                signature: Arc::from([]),
+            }),
+        },
+    );
+    assert!(plane.route_table().get(&peer).is_some());
+    assert_eq!(Arc::strong_count(&canonical_bytes), 2);
+
+    let expires_at = received_at.as_millis() + u64::from(DEFAULT_LSA_TTL_SEC) * 1_000;
+    plane.handle(
+        MonoTime::from_millis(expires_at),
+        ControlEvent::Timer(ControlTimer::LsaExpire {
+            origin: peer,
+            epoch: 1,
+            seq: 7,
+        }),
+    );
+    assert_eq!(plane.lsa_is_expired(&peer), Some(true));
+    assert!(plane.route_table().get(&peer).is_none());
+    assert_eq!(Arc::strong_count(&canonical_bytes), 1);
+
+    let stale_actions = plane.handle(
+        MonoTime::from_millis(expires_at + 1),
+        ControlEvent::Frame {
+            link,
+            frame: ControlFrame::Lsa(LsaMessage {
+                lsa: peer_lsa.clone(),
+                canonical_bytes: Arc::from([]),
+                signature: Arc::from([]),
+            }),
+        },
+    );
+    assert!(stale_actions.is_empty());
+    assert!(plane.lsa(&peer).is_none());
+    assert_eq!(plane.lsa_received_at(&peer), None);
+    assert_eq!(plane.lsa_is_expired(&peer), Some(true));
+
+    let much_later = expires_at + u64::from(DEFAULT_LSA_TTL_SEC) * 10_000;
+    let late_stale_actions = plane.handle(
+        MonoTime::from_millis(much_later),
+        ControlEvent::Frame {
+            link,
+            frame: ControlFrame::Lsa(LsaMessage {
+                lsa: peer_lsa.clone(),
+                canonical_bytes: Arc::from([]),
+                signature: Arc::from([]),
+            }),
+        },
+    );
+    assert!(late_stale_actions.is_empty());
+    assert!(plane.lsa(&peer).is_none());
+    assert_eq!(plane.lsa_is_expired(&peer), Some(true));
+
+    let mut newer_lsa = peer_lsa;
+    newer_lsa.seq += 1;
+    plane.handle(
+        MonoTime::from_millis(much_later + 1),
+        ControlEvent::Frame {
+            link,
+            frame: ControlFrame::Lsa(LsaMessage {
+                lsa: newer_lsa,
+                canonical_bytes: Arc::from([]),
+                signature: Arc::from([]),
+            }),
+        },
+    );
+    assert_eq!(plane.lsa(&peer).map(|lsa| lsa.seq), Some(8));
+    assert_eq!(plane.lsa_is_expired(&peer), Some(false));
+}
+
+#[test]
+fn timers_for_a_replaced_lsa_are_ignored() {
+    let me = node(1);
+    let peer = node(2);
+    let link = LinkId::new(1);
+    let mut plane = ControlPlane::new_unsecured(me, 1);
+    plane.handle(
+        MonoTime::ZERO,
+        ControlEvent::LinkUp {
+            link,
+            peer,
+            cost: cost(10),
+        },
+    );
+
+    for seq in [1, 2] {
+        plane.handle(
+            MonoTime::from_millis(seq),
+            ControlEvent::Frame {
+                link,
+                frame: ControlFrame::Lsa(LsaMessage {
+                    lsa: Lsa {
+                        origin: peer,
+                        epoch: 1,
+                        seq,
+                        ttl_sec: DEFAULT_LSA_TTL_SEC,
+                        adjacencies: vec![Adjacency {
+                            peer: me,
+                            cost: cost(10),
+                        }],
+                    },
+                    canonical_bytes: Arc::from([]),
+                    signature: Arc::from([]),
+                }),
+            },
+        );
+    }
+
+    assert!(plane
+        .handle(
+            MonoTime::from_millis(u64::from(DEFAULT_LSA_TTL_SEC) * 1_000 + 1),
+            ControlEvent::Timer(ControlTimer::LsaExpire {
+                origin: peer,
+                epoch: 1,
+                seq: 1,
+            }),
+        )
+        .is_empty());
+    assert_eq!(plane.lsa(&peer).map(|lsa| lsa.seq), Some(2));
+    assert_eq!(plane.lsa_is_expired(&peer), Some(false));
+}
+
+#[test]
+fn injected_last_sequence_is_advanced_on_first_origination() {
+    let mut plane = ControlPlane::new_unsecured_with_seq(node(1), 3, 4_999);
+    let actions = plane.handle(
+        MonoTime::ZERO,
+        ControlEvent::LinkUp {
+            link: LinkId::new(1),
+            peer: node(2),
+            cost: cost(10),
+        },
+    );
+
+    assert_eq!(plane.lsa(&node(1)).map(|lsa| lsa.seq), Some(5_000));
+    assert!(matches!(
+        actions.first(),
+        Some(ControlAction::PersistSeq(5_000))
+    ));
+}
+
+#[test]
+fn oversized_control_collections_and_invalid_ttl_are_rejected() {
+    let me = node(1);
+    let peer = node(2);
+    let link = LinkId::new(1);
+    let mut plane = ControlPlane::new_unsecured(me, 1);
+    plane.handle(
+        MonoTime::ZERO,
+        ControlEvent::LinkUp {
+            link,
+            peer,
+            cost: cost(10),
+        },
+    );
+
+    let invalid_lsa = LsaMessage {
+        lsa: Lsa {
+            origin: peer,
+            epoch: 1,
+            seq: 1,
+            ttl_sec: 0,
+            adjacencies: Vec::new(),
+        },
+        canonical_bytes: Arc::from([]),
+        signature: Arc::from([]),
+    };
+    assert!(plane
+        .handle(
+            MonoTime::from_millis(1),
+            ControlEvent::Frame {
+                link,
+                frame: ControlFrame::Lsa(invalid_lsa),
+            },
+        )
+        .is_empty());
+
+    let adjacency = Adjacency {
+        peer: me,
+        cost: cost(1),
+    };
+    let oversized_lsa = LsaMessage {
+        lsa: Lsa {
+            origin: peer,
+            epoch: 1,
+            seq: 1,
+            ttl_sec: DEFAULT_LSA_TTL_SEC,
+            adjacencies: vec![adjacency; MAX_LSA_ADJACENCIES + 1],
+        },
+        canonical_bytes: Arc::from([]),
+        signature: Arc::from([]),
+    };
+    assert!(plane
+        .handle(
+            MonoTime::from_millis(2),
+            ControlEvent::Frame {
+                link,
+                frame: ControlFrame::Lsa(oversized_lsa),
+            },
+        )
+        .is_empty());
+    assert!(plane
+        .handle(
+            MonoTime::from_millis(3),
+            ControlEvent::Frame {
+                link,
+                frame: ControlFrame::Digest(vec![
+                    mb_control::DigestEntry {
+                        origin: peer,
+                        epoch: 1,
+                        seq: 1,
+                    };
+                    MAX_DIGEST_ENTRIES + 1
+                ]),
+            },
+        )
+        .is_empty());
+    assert!(plane
+        .handle(
+            MonoTime::from_millis(4),
+            ControlEvent::Frame {
+                link,
+                frame: ControlFrame::DigestReq(vec![peer; MAX_DIGEST_REQ_ORIGINS + 1]),
+            },
+        )
+        .is_empty());
+}
+
+#[test]
+fn lsdb_size_is_bounded() {
+    fn numbered_node(value: u16) -> NodeId {
+        let mut bytes = [0_u8; 32];
+        bytes[30..].copy_from_slice(&value.to_be_bytes());
+        NodeId::from_bytes(bytes)
+    }
+
+    let me = numbered_node(0);
+    let link = LinkId::new(1);
+    let mut plane = ControlPlane::new_unsecured(me, 1);
+    plane.handle(
+        MonoTime::ZERO,
+        ControlEvent::LinkUp {
+            link,
+            peer: numbered_node(1),
+            cost: cost(10),
+        },
+    );
+    for value in 1..=u16::try_from(MAX_LSDB_ENTRIES).expect("limit fits in u16") {
+        plane.handle(
+            MonoTime::from_millis(u64::from(value)),
+            ControlEvent::Frame {
+                link,
+                frame: ControlFrame::Lsa(LsaMessage {
+                    lsa: Lsa {
+                        origin: numbered_node(value),
+                        epoch: 1,
+                        seq: 1,
+                        ttl_sec: DEFAULT_LSA_TTL_SEC,
+                        adjacencies: Vec::new(),
+                    },
+                    canonical_bytes: Arc::from([]),
+                    signature: Arc::from([]),
+                }),
+            },
+        );
+    }
+
+    assert_eq!(plane.lsdb_len(), MAX_LSDB_ENTRIES);
+    assert!(plane.lsa(&me).is_some());
+    assert!(plane.lsa(&numbered_node(1_000)).is_none());
+
+    let first_remote = numbered_node(1);
+    plane.handle(
+        MonoTime::from_millis(1 + u64::from(DEFAULT_LSA_TTL_SEC) * 1_000),
+        ControlEvent::Timer(ControlTimer::LsaExpire {
+            origin: first_remote,
+            epoch: 1,
+            seq: 1,
+        }),
+    );
+    assert_eq!(plane.lsa_is_expired(&first_remote), Some(true));
+
+    let unknown = numbered_node(1_001);
+    plane.handle(
+        MonoTime::from_millis(1_000_000),
+        ControlEvent::Frame {
+            link,
+            frame: ControlFrame::Lsa(LsaMessage {
+                lsa: Lsa {
+                    origin: unknown,
+                    epoch: 1,
+                    seq: 1,
+                    ttl_sec: DEFAULT_LSA_TTL_SEC,
+                    adjacencies: Vec::new(),
+                },
+                canonical_bytes: Arc::from([]),
+                signature: Arc::from([]),
+            }),
+        },
+    );
+    assert!(plane.lsa(&unknown).is_none());
+    assert_eq!(plane.lsa_is_expired(&first_remote), Some(true));
 }

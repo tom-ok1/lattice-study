@@ -18,6 +18,7 @@ message Adjacency {
 message Lsa {
   bytes origin = 1;
   uint64 seq = 2;
+  uint32 ttl_sec = 4;
   repeated Adjacency adjacencies = 10;
   uint32 epoch = 20;
 }

@@ -80,8 +80,8 @@ message SignedLsa {
 
 ### 2.2 seq の永続化
 
-`seq` は再起動をまたいで単調増加させる。ローカルストレージに保存し、起動時に `saved + 1000` から始める（クラッシュで書き込み前の seq を失っても追い越せるように）。
-ストレージが失われた場合は `epoch` を上げる。受信側は「同 origin で epoch が大きければ seq を無視して採用」する。
+`seq` は再起動をまたいで単調増加させる。新しい LSA は送信前にローカルストレージへ保存し、起動時は `saved + 1` から始める。
+ストレージが失われた、または古い状態へ巻き戻った場合は `epoch` を上げる。受信側は「同 origin で epoch が大きければ seq を無視して採用」する。
 
 ## 3. 双方向アサーションによる辺の採用
 
@@ -147,17 +147,24 @@ pub struct Lsdb {
 }
 
 pub struct LsdbEntry {
-    lsa: Lsa,                  // デコード済み
-    signed_bytes: Bytes,       // 転送用にそのまま保持（再署名しない）
-    received_at: Instant,
-    expires_at: Instant,       // received_at + ttl
-    verified: bool,            // 署名検証済み（未検証は SPF に使わない）
+    version: (u32, u64),       // 一度受理した最大 (epoch, seq)。削除しない
+    state: LsdbEntryState,
+}
+
+pub enum LsdbEntryState {
+    Active {
+        lsa: Lsa,              // デコード済み
+        signed_bytes: Bytes,   // 転送用にそのまま保持（再署名しない）
+        received_at: Instant,
+        expires_at: Instant,   // received_at + ttl
+    },
+    Tombstone,                 // LSA 本体を持たない compact な version floor
 }
 ```
 
-- **失効**：`expires_at` を過ぎたエントリは SPF から除外し、さらに `ttl` 後に削除する（除外と削除を分けるのは、失効直後に再受信した古い LSA を「新しい」と誤認しないため）
+- **失効**：`expires_at` を過ぎたエントリは SPF から除外し、LSA 本体・署名・canonical bytes を破棄して Tombstone にする。最大 `(epoch, seq)` は残し、古い LSA の再受理を防ぐ
 - **自 LSA の再発行**：`ttl / 5` ごと。隣接リンクが Radio/Satcom のみなら `ttl / 2`
-- **メモリ上限**：エントリ数 1000、超過は最古から削除（DoS 対策。正規ノードは 300 想定）
+- **メモリ上限**：Active と Tombstone の合計 1000 origin。上限到達後は既存 Tombstone を追い出さず、未知 origin を拒否する（正規ノードは 300 想定。署名・membership 導入前の未知 origin による枯渇は既知の制約）
 
 ## 6. SPF と経路表
 
