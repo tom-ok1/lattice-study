@@ -5,6 +5,7 @@ members = [
     "crates/mb-wire",
     "crates/mb-transport",
     "crates/mb-runtime",
+    "crates/mb-forward",
 ]
 resolver = "2"
 

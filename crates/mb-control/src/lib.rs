@@ -196,6 +196,10 @@ pub struct RouteTable {
 }
 
 impl RouteTable {
+    pub fn new(version: u64, routes: BTreeMap<NodeId, Route>) -> Self {
+        Self { version, routes }
+    }
+
     pub fn get(&self, destination: &NodeId) -> Option<&Route> {
         self.routes.get(destination)
     }

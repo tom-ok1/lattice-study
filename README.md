@@ -53,15 +53,16 @@ Anduril Lattice の DSB (Distributed Service Bus) / Lattice Mesh を公開情報
 
 ## 実装状況
 
-最初の縦切りとして、I/O を持たない最小制御プレーンと、それを実 TCP から駆動する runtime を実装済み。
+最初の縦切りとして、I/O を持たない制御プレーンと最小ユニキャスト転送、それを実 TCP から駆動する control runtime を実装済み。
 
 - `mb-types`: `NodeId`、`LinkId`、単調時刻、`Component` 境界
 - `mb-control`: TTL 付き adjacency LSA、LSDB、フラッディング、Anti-Entropy、失効・再発行、双方向アサーション、SPF hold timer、Dijkstra
-- 決定論的な 3 ノード用テストハーネス
-- `mb-wire`: LSA/Digest protobuf、固定 8 byte header、1 MiB 上限、incremental decoder
+- イベント時刻と投入順で駆動する決定論的な 5 ノード用テストハーネス
+- `mb-wire`: LSA/Digest protobuf、固定 8 byte Link header、固定 88 byte Forward header、1 MiB 上限、incremental decoder
+- `mb-forward`: `RouteTable` による I/O なしのユニキャスト転送、TTL、no-route、ループ検知
 - `mb-transport`: TLS なし・静的ピア限定の TCP adapter
 - `mb-runtime`: TCP と control の Event/Action、単調時刻 Timer、再起動をまたぐ seq 永続化を接続する Tokio glue
-- 仮想時刻による LSA 再発行・失効・compact tombstone テストと、loopback TCP 上の動的な 3 ノード参加・経路収束テスト
+- 仮想時刻による 5 ノードの経路収束・分断・短経路への再収束と、loopback TCP 上の動的な 3 ノード参加・経路収束テスト
 
 ```sh
 cargo test --workspace

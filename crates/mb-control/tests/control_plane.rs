@@ -1,12 +1,14 @@
 use mb_control::{
     Adjacency, ControlAction, ControlEvent, ControlFrame, ControlPlane, ControlTimer, LinkCost,
-    Lsa, LsaMessage, DEFAULT_LSA_TTL_SEC, DIGEST_INTERVAL_MS, MAX_DIGEST_ENTRIES,
+    Lsa, LsaMessage, RouteTable, DEFAULT_LSA_TTL_SEC, DIGEST_INTERVAL_MS, MAX_DIGEST_ENTRIES,
     MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSDB_ENTRIES, SPF_INITIAL_HOLD_MS,
     SPF_MAX_HOLD_MS, SPF_QUIET_RESET_MS,
 };
 use mb_types::{Component, LinkId, MonoTime, NodeId};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+const PHASE_ONE_CONVERGENCE_BUDGET_MS: u64 = 5_000;
 
 fn node(value: u8) -> NodeId {
     let mut bytes = [0_u8; 32];
@@ -48,15 +50,22 @@ fn reciprocal_lsa(origin: NodeId, peer: NodeId, seq: u64) -> LsaMessage {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PhaseOneScenarioResult {
+    event_log: Vec<String>,
+    route_tables: Vec<Arc<RouteTable>>,
+    convergence_times_ms: [u64; 3],
+}
+
 struct Harness {
     nodes: Vec<ControlPlane>,
     endpoints: BTreeMap<(usize, LinkId), (usize, LinkId)>,
-    queue: VecDeque<(usize, ControlEvent)>,
-    spf_timers: BTreeMap<(u64, u64), (usize, ControlTimer)>,
+    queue: BTreeMap<(u64, u64), (usize, ControlEvent)>,
     next_link: u64,
-    next_timer: u64,
+    next_event: u64,
     now_ms: u64,
     event_log: Vec<String>,
+    route_publications: Vec<(u64, usize, Arc<RouteTable>)>,
 }
 
 impl Harness {
@@ -68,12 +77,12 @@ impl Harness {
                 .map(|id| ControlPlane::new_unsecured(id, 1))
                 .collect(),
             endpoints: BTreeMap::new(),
-            queue: VecDeque::new(),
-            spf_timers: BTreeMap::new(),
+            queue: BTreeMap::new(),
             next_link: 1,
-            next_timer: 0,
+            next_event: 0,
             now_ms: 0,
             event_log: Vec::new(),
+            route_publications: Vec::new(),
         }
     }
 
@@ -85,22 +94,24 @@ impl Harness {
         self.endpoints
             .insert((right, right_link), (left, left_link));
 
-        self.queue.push_back((
+        let left_peer = self.nodes[right].node_id();
+        let right_peer = self.nodes[left].node_id();
+        self.schedule_next(
             left,
             ControlEvent::LinkUp {
                 link: left_link,
-                peer: self.nodes[right].node_id(),
+                peer: left_peer,
                 cost: link_cost,
             },
-        ));
-        self.queue.push_back((
+        );
+        self.schedule_next(
             right,
             ControlEvent::LinkUp {
                 link: right_link,
-                peer: self.nodes[left].node_id(),
+                peer: right_peer,
                 cost: link_cost,
             },
-        ));
+        );
         (left_link, right_link)
     }
 
@@ -110,14 +121,12 @@ impl Harness {
             .remove(&(left, left_link))
             .expect("link must exist");
         self.endpoints.remove(&(right, right_link));
-        self.queue
-            .push_back((left, ControlEvent::LinkDown { link: left_link }));
-        self.queue
-            .push_back((right, ControlEvent::LinkDown { link: right_link }));
+        self.schedule_next(left, ControlEvent::LinkDown { link: left_link });
+        self.schedule_next(right, ControlEvent::LinkDown { link: right_link });
     }
 
     fn inject(&mut self, target: usize, incoming: LinkId, lsa: Lsa) {
-        self.queue.push_back((
+        self.schedule_next(
             target,
             ControlEvent::Frame {
                 link: incoming,
@@ -127,7 +136,7 @@ impl Harness {
                     signature: Arc::from([]),
                 }),
             },
-        ));
+        );
     }
 
     fn run_until_idle(&mut self) {
@@ -139,24 +148,15 @@ impl Harness {
         mut should_deliver: impl FnMut(usize, &ControlEvent) -> bool,
     ) {
         let mut processed = 0_usize;
-        loop {
-            let scheduled = if let Some((target, event)) = self.queue.pop_front() {
-                Some((self.now_ms.saturating_add(1), target, event))
-            } else {
-                self.spf_timers
-                    .pop_first()
-                    .map(|((at, _), (target, timer))| (at, target, ControlEvent::Timer(timer)))
-            };
-            let Some((at, target, event)) = scheduled else {
-                break;
-            };
+        while let Some(((at, _), (target, event))) = self.queue.pop_first() {
             processed += 1;
             assert!(processed < 10_000, "control plane did not quiesce");
+            self.now_ms = self.now_ms.max(at);
             if !should_deliver(target, &event) {
                 continue;
             }
-            self.now_ms = self.now_ms.saturating_add(1).max(at);
-            self.event_log.push(format!("{target}:{event:?}"));
+            self.event_log
+                .push(format!("{}:{target}:{event:?}", self.now_ms));
             let actions = self.nodes[target].handle(MonoTime::from_millis(self.now_ms), event);
             for action in actions {
                 match action {
@@ -164,29 +164,44 @@ impl Harness {
                         if let Some((peer, peer_link)) =
                             self.endpoints.get(&(target, link)).copied()
                         {
-                            self.queue.push_back((
+                            self.schedule_next(
                                 peer,
                                 ControlEvent::Frame {
                                     link: peer_link,
                                     frame,
                                 },
-                            ));
+                            );
                         }
                     }
                     ControlAction::SetTimer {
                         timer: timer @ ControlTimer::SpfHold { .. },
                         at,
                     } => {
-                        self.spf_timers
-                            .insert((at.as_millis(), self.next_timer), (target, timer));
-                        self.next_timer = self.next_timer.wrapping_add(1);
+                        self.schedule(at.as_millis(), target, ControlEvent::Timer(timer));
                     }
-                    ControlAction::SetTimer { .. }
-                    | ControlAction::PublishRoutes(_)
-                    | ControlAction::PersistSeq(_) => {}
+                    ControlAction::PublishRoutes(routes) => {
+                        self.route_publications.push((self.now_ms, target, routes));
+                    }
+                    ControlAction::SetTimer { .. } | ControlAction::PersistSeq(_) => {}
                 }
             }
         }
+    }
+
+    fn schedule_next(&mut self, target: usize, event: ControlEvent) {
+        self.schedule(self.now_ms.saturating_add(1), target, event);
+    }
+
+    fn schedule(&mut self, at_ms: u64, target: usize, event: ControlEvent) {
+        self.queue.insert((at_ms, self.next_event), (target, event));
+        self.next_event = self.next_event.wrapping_add(1);
+    }
+
+    fn last_route_publication_after(&self, changed_at_ms: u64) -> Option<u64> {
+        self.route_publications
+            .iter()
+            .filter_map(|(at, _, _)| (*at > changed_at_ms).then_some(*at))
+            .max()
     }
 
     fn allocate_link(&mut self) -> LinkId {
@@ -290,6 +305,142 @@ fn identical_inputs_produce_an_identical_event_sequence() {
     }
 
     assert_eq!(run(), run());
+}
+
+fn run_phase_one_five_node_scenario() -> PhaseOneScenarioResult {
+    let ids = [node(1), node(2), node(3), node(4), node(5)];
+    let mut harness = Harness::new(&ids);
+    let initial_change_at = harness.now_ms;
+    let (a_to_b, _) = harness.connect(0, 1, cost(10));
+    let (b_to_c, _) = harness.connect(1, 2, cost(10));
+    harness.connect(2, 3, cost(10));
+    harness.connect(3, 4, cost(10));
+
+    harness.run_until_idle();
+
+    let initial_converged_at = harness
+        .last_route_publication_after(initial_change_at)
+        .expect("the initial topology must publish routes");
+    assert!(
+        initial_converged_at - initial_change_at <= PHASE_ONE_CONVERGENCE_BUDGET_MS,
+        "initial convergence took {} ms",
+        initial_converged_at - initial_change_at
+    );
+    assert!(harness.nodes.iter().all(|plane| plane.lsdb_len() == 5));
+    for origin in ids {
+        let expected = harness.nodes[0].lsa(&origin);
+        assert!(harness
+            .nodes
+            .iter()
+            .all(|plane| plane.lsa(&origin) == expected));
+    }
+    assert!(harness
+        .nodes
+        .iter()
+        .all(|plane| plane.route_table().len() == 4));
+    let initial_a_to_e = harness.nodes[0]
+        .route_table()
+        .get(&ids[4])
+        .cloned()
+        .expect("A must have a route to E");
+    assert_eq!(initial_a_to_e.next_hop, a_to_b);
+    assert_eq!(initial_a_to_e.cost, 40);
+    assert_eq!(initial_a_to_e.hops, 4);
+
+    let partition_change_at = harness.now_ms;
+    harness.disconnect(1, b_to_c);
+    harness.run_until_idle();
+
+    let partition_converged_at = harness
+        .last_route_publication_after(partition_change_at)
+        .expect("the partition must publish updated routes");
+    assert!(
+        partition_converged_at - partition_change_at <= PHASE_ONE_CONVERGENCE_BUDGET_MS,
+        "partition convergence took {} ms",
+        partition_converged_at - partition_change_at
+    );
+    for left in 0..=1 {
+        for destination in &ids[2..] {
+            assert!(
+                harness.nodes[left].route_table().get(destination).is_none(),
+                "node {left} retained a route across the partition to {destination}"
+            );
+        }
+    }
+    for right in 2..ids.len() {
+        for destination in &ids[..2] {
+            assert!(
+                harness.nodes[right]
+                    .route_table()
+                    .get(destination)
+                    .is_none(),
+                "node {right} retained a route across the partition to {destination}"
+            );
+        }
+    }
+    assert_eq!(harness.nodes[0].route_table().len(), 1);
+    assert_eq!(harness.nodes[1].route_table().len(), 1);
+    assert!(harness.nodes[3].route_table().get(&ids[4]).is_some());
+
+    let shortcut_change_at = harness.now_ms;
+    let (a_to_d, _) = harness.connect(0, 3, cost(10));
+    harness.run_until_idle();
+
+    let shortcut_converged_at = harness
+        .last_route_publication_after(shortcut_change_at)
+        .expect("the shortcut must publish updated routes");
+    assert!(
+        shortcut_converged_at - shortcut_change_at <= PHASE_ONE_CONVERGENCE_BUDGET_MS,
+        "shortcut convergence took {} ms",
+        shortcut_converged_at - shortcut_change_at
+    );
+    assert!(harness.nodes.iter().all(|plane| plane.lsdb_len() == 5));
+    for origin in ids {
+        let expected = harness.nodes[0].lsa(&origin);
+        assert!(harness
+            .nodes
+            .iter()
+            .all(|plane| plane.lsa(&origin) == expected));
+    }
+    assert!(harness
+        .nodes
+        .iter()
+        .all(|plane| plane.route_table().len() == 4));
+    let shortcut_a_to_e = harness.nodes[0]
+        .route_table()
+        .get(&ids[4])
+        .cloned()
+        .expect("A must regain a route to E");
+    assert_eq!(shortcut_a_to_e.next_hop, a_to_d);
+    assert_eq!(shortcut_a_to_e.cost, 20);
+    assert_eq!(shortcut_a_to_e.hops, 2);
+
+    PhaseOneScenarioResult {
+        event_log: harness.event_log,
+        route_tables: harness
+            .nodes
+            .iter()
+            .map(ControlPlane::route_table)
+            .collect(),
+        convergence_times_ms: [
+            initial_converged_at,
+            partition_converged_at,
+            shortcut_converged_at,
+        ],
+    }
+}
+
+#[test]
+fn phase_one_five_node_topology_converges_and_reconverges() {
+    run_phase_one_five_node_scenario();
+}
+
+#[test]
+fn phase_one_five_node_scenario_is_deterministic() {
+    assert_eq!(
+        run_phase_one_five_node_scenario(),
+        run_phase_one_five_node_scenario()
+    );
 }
 
 #[test]
@@ -520,9 +671,7 @@ fn periodic_digest_repairs_an_lsa_lost_during_initial_flooding() {
     assert_eq!(harness.nodes[0].lsdb_len(), 2);
     assert_eq!(harness.nodes[1].lsdb_len(), 1);
 
-    harness
-        .queue
-        .push_back((0, ControlEvent::Timer(ControlTimer::Digest(a_to_b))));
+    harness.schedule_next(0, ControlEvent::Timer(ControlTimer::Digest(a_to_b)));
     harness.run_until_idle();
 
     assert_eq!(harness.nodes[1].lsdb_len(), 2);

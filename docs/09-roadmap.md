@@ -44,7 +44,7 @@ A-D の直接リンクを追加 → A→E が 2 hop に変わる
 
 **目標**：多段ホップで任意ノードにパケットが届く。優先度が守られる。
 
-- [ ] `mb-forward`：80(88) バイトヘッダ、転送ループ、TTL、ループ検知
+- [x] `mb-forward`：88 バイトヘッダ、転送ループ、TTL、ループ検知
 - [ ] 優先度キュー（P0 厳密 + P1〜P3 DRR）
 - [ ] Conflation
 - [ ] Explicit Multicast の fan-out

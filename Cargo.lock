@@ -179,6 +179,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mb-forward"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "mb-control",
+ "mb-types",
+ "mb-wire",
+]
+
+[[package]]
 name = "mb-runtime"
 version = "0.1.0"
 dependencies = [
@@ -211,6 +221,7 @@ name = "mb-wire"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "mb-types",
  "prost",
  "prost-build",
  "protoc-bin-vendored",

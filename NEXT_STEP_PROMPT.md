@@ -8,18 +8,16 @@
 
 現在は次の縦切りまで完了しています。
 
-- `mb-types`: `NodeId`、`LinkId`、`MonoTime`、I/O なしの `Component` 境界
-- `mb-control`: 最小 LSA、LSDB、フラッディング、双方向アサーション、Dijkstra、`RouteTable`
-- `Digest` / `DigestReq` による Link Up 時と周期的な Anti-Entropy
-- `ControlEvent::Timer` / `ControlAction::SetTimer` と Tokio runtime のタイマー配送
-- TTL による LSA の周期再発行、失効、compact tombstone 化
-- 保存済み seq の次からの再開と、runtime のメモリ／ファイル永続化 adapter
-- LSDB、LSA adjacency、Digest、DigestReq の要素数上限
-- 100 ms 初期、最大 5 s、10 s quiet reset の SPF hold timer
-- generation による stale SPF timer の無視と、burst 中の経路再計算・公開の集約
-- 動的参加と LSA 取りこぼし復旧の決定論テスト、loopback TCP テスト
+- `mb-control` の LSA、LSDB、Anti-Entropy、失効、SPF hold timer、Dijkstra
+- 5 ノードの初期収束、分断、短経路追加後の再収束を検証する決定論テスト
+- `mb-wire` の固定 8 byte Link header と固定 88 byte Forward header
+- Forward header の version、packet type、priority、flags、サイズ制限の検証
+- `mb-forward` の I/O なし `Component` 境界
+- `RouteTable` に従うユニキャスト転送、ローカル配送、TTL decrement
+- TTL exceeded、no route、incoming link への折り返し、未対応 packet type の明示的 drop
+- A-B-C の 2 hop 転送と Action 列の決定性テスト
 
-次の目的は、**Phase 1 の完了条件を決定論テストとして固定し、5 ノードの経路収束とトポロジ変更後の再収束を検証できる状態にすること**です。
+次の目的は、**Phase 2 の次の縦切りとして、Link ごとの有限な優先度キューと送信 credit を `mb-forward` に追加し、P3 が滞留していても P0 が先に送信されることを決定論テストで保証すること**です。
 
 まずドキュメントと依存関係を確認し、実装前に短く以下を示してください。
 
@@ -30,19 +28,23 @@
 
 有力なスコープは以下です。
 
-- A-B-C-D-E の 5 ノードチェーンを構築し、A から E が 4 hop になることを検証する
-- B-C を切断し、分断された宛先が各ノードの経路表から 5 秒以内に消えることを検証する
-- A-D の直接リンクを追加し、A から E が 2 hop の経路へ再収束することを検証する
-- SPF hold timer を含む仮想時刻を明示的に進め、収束時刻をテスト結果から確認できるようにする
-- 同じ入力から同じイベント列と経路表が得られる決定性を維持する
+- `ForwardEvent::LinkCredit` と Link ごとの利用可能 byte credit を追加する
+- 即時 `Send` せず、next-hop の priority queue に packet を積む
+- P0 は厳密優先、P1〜P3 は決定的な DRR で選択する
+- 各 priority queue に packet 数または byte 数の明示的な上限を設ける
+- overflow を `Backpressure` または明示的な drop reason として返す
+- credit を超える packet は送信せず、次の credit 通知まで保持する
+- P3 を先に大量投入してから P0 を投入し、credit 付与時に P0 が先に `Send` されることを検証する
+- 同じ Event 列から同じ Action 列と queue 状態が得られることを検証する
 
 必須の設計制約は次のとおりです。
 
-- `mb-control` に `tokio`、socket、ファイル I/O、実時刻取得を入れない
-- runtime は Timer/Event を投入して Action を実行するだけにする
-- テストハーネスは将来の `mb-sim` と同じく、イベント時刻と投入順で決定的に駆動する
-- 既存の LSA lifecycle、Anti-Entropy、canonical LSA bytes の保持を壊さない
-- `mb-forward`、ECMP、TLS、QUIC、Admin API、Pub/Sub、メトリクスは今回の目的に含めない
+- `mb-forward` に `tokio`、socket、ファイル I/O、実時刻取得を入れない
+- packet priority は payload ではなく 88 byte header だけから判断する
+- キューは必ず有限にし、overflow 動作を型とテストで明示する
+- DRR の巡回順と tie-break を決定的にする
+- 既存のユニキャスト、TTL、no-route、loop 検知を壊さない
+- Conflation、Explicit Multicast、ECMP、Link Down 再キュー、P0 no-route 待機、runtime 接続は今回含めない
 - 既存のユーザー変更を保持する
 
 実装後は少なくとも以下を実行してください。
@@ -53,4 +55,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-環境に Rust がなければ勝手に恒久インストールせず、一時ツールチェーンを使うか必要な許可を求めてください。最後に、変更内容、検証結果、意図的な未実装範囲、次に進むべき一手を簡潔に報告してください。コミットや Push は依頼された場合だけ行ってください。
+最後に、変更内容、検証結果、意図的な未実装範囲、次に進むべき一手を簡潔に報告してください。コミットや Push は依頼された場合だけ行ってください。
