@@ -26,9 +26,23 @@ const READ_CHUNK_CAPACITY: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LinkEvent {
-    Up { link: LinkId, peer: NodeId },
-    Down { link: LinkId },
-    Frame { link: LinkId, frame: WireFrame },
+    Up {
+        link: LinkId,
+        peer: NodeId,
+    },
+    Down {
+        link: LinkId,
+    },
+    Frame {
+        link: LinkId,
+        frame: WireFrame,
+    },
+    Sent {
+        link: LinkId,
+        frame_type: FrameType,
+        channel: Channel,
+        payload_bytes: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -379,10 +393,21 @@ async fn run_link(
             command = commands.recv() => {
                 match command {
                     Some(LinkCommand::Send(frame)) => {
+                        let frame_type = frame.frame_type;
+                        let channel = frame.channel;
+                        let payload_bytes = frame.payload.len();
                         let Ok(encoded) = FrameEncoder::encode(&frame) else {
                             break;
                         };
                         if writer.write_all(&encoded).await.is_err() {
+                            break;
+                        }
+                        if inner.events.send(LinkEvent::Sent {
+                            link,
+                            frame_type,
+                            channel,
+                            payload_bytes,
+                        }).await.is_err() {
                             break;
                         }
                     }
@@ -463,6 +488,19 @@ mod tests {
             LinkEvent::Frame {
                 link: link_b,
                 frame: sent
+            }
+        );
+        let completion = timeout(Duration::from_secs(2), events_a.recv())
+            .await
+            .expect("A must observe send completion")
+            .expect("A event channel must remain open");
+        assert_eq!(
+            completion,
+            LinkEvent::Sent {
+                link: link_a,
+                frame_type: FrameType::Lsa,
+                channel: Channel::Control,
+                payload_bytes: b"protobuf".len(),
             }
         );
 

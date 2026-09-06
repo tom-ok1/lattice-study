@@ -1,10 +1,12 @@
+use bytes::Bytes;
 use mb_control::LinkCost;
-use mb_runtime::{ControlRuntime, RuntimeConfig, RuntimeSnapshot};
+use mb_runtime::{ControlRuntime, ForwardOutcome, RuntimeConfig};
 use mb_transport::TcpEndpoint;
 use mb_types::NodeId;
+use mb_wire::{ForwardFlags, ForwardHeader, ForwardPacket, PacketType, Priority};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use tokio::sync::watch;
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
 fn node(value: u8) -> NodeId {
@@ -34,28 +36,6 @@ async fn wait_for_links(endpoint: &TcpEndpoint, expected: usize) {
     .expect("static TCP links must become ready");
 }
 
-async fn wait_for_snapshot(
-    snapshots: &mut watch::Receiver<RuntimeSnapshot>,
-    predicate: impl Fn(&RuntimeSnapshot) -> bool,
-) -> RuntimeSnapshot {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            {
-                let snapshot = snapshots.borrow();
-                if predicate(&snapshot) {
-                    return snapshot.clone();
-                }
-            }
-            snapshots
-                .changed()
-                .await
-                .expect("control runtime must remain available");
-        }
-    })
-    .await
-    .expect("control planes must converge")
-}
-
 fn runtime_config(
     node_id: NodeId,
     peer_costs: impl IntoIterator<Item = (NodeId, LinkCost)>,
@@ -67,8 +47,68 @@ fn runtime_config(
     }
 }
 
+fn packet(
+    source: NodeId,
+    destination: NodeId,
+    priority: Priority,
+    body: &'static [u8],
+) -> ForwardPacket {
+    ForwardPacket {
+        header: ForwardHeader {
+            packet_type: PacketType::Unicast,
+            priority,
+            ttl: 32,
+            flags: ForwardFlags::empty(),
+            destination,
+            source,
+            flow_id: 7,
+            conflate_key: 0,
+        },
+        multicast_destinations: Vec::new(),
+        payload: Bytes::from_static(body),
+    }
+}
+
+async fn wait_for_delivery(outcomes: &mut mpsc::Receiver<ForwardOutcome>) -> ForwardPacket {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let ForwardOutcome::Delivered(packet) = outcomes
+                .recv()
+                .await
+                .expect("forward runtime must remain available")
+            {
+                return packet;
+            }
+        }
+    })
+    .await
+    .expect("packet must be delivered")
+}
+
+async fn wait_for_routed_delivery(
+    runtime: &ControlRuntime,
+    outcomes: &mut mpsc::Receiver<ForwardOutcome>,
+    packet: ForwardPacket,
+) -> ForwardPacket {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            runtime
+                .send(packet.clone())
+                .await
+                .expect("runtime must accept a valid packet");
+            match timeout(Duration::from_millis(25), outcomes.recv()).await {
+                Ok(Some(ForwardOutcome::Delivered(delivered))) => return delivered,
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => panic!("forward runtime stopped before delivery"),
+            }
+        }
+    })
+    .await
+    .expect("route must converge and deliver the packet")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn three_nodes_converge_over_real_loopback_tcp_links() {
+async fn three_nodes_converge_and_forward_over_real_loopback_tcp_links() {
     let [a, b, c] = [node(1), node(2), node(3)];
     let bind_addr: SocketAddr = "127.0.0.1:0"
         .parse()
@@ -90,22 +130,25 @@ async fn three_nodes_converge_over_real_loopback_tcp_links() {
         events_a,
     )
     .expect("A runtime must start");
-    let runtime_b = ControlRuntime::spawn(
+    let mut runtime_b = ControlRuntime::spawn(
         runtime_config(b, [(a, cost(10)), (c, cost(20))]),
         endpoint_b.clone(),
         events_b,
     )
     .expect("B runtime must start");
-    let runtime_c = ControlRuntime::spawn(
+    let mut runtime_c = ControlRuntime::spawn(
         runtime_config(c, [(b, cost(20))]),
         endpoint_c.clone(),
         events_c,
     )
     .expect("C runtime must start");
 
-    let mut snapshots_a = runtime_a.subscribe();
-    let mut snapshots_b = runtime_b.subscribe();
-    let mut snapshots_c = runtime_c.subscribe();
+    let mut outcomes_b = runtime_b
+        .take_forward_outcomes()
+        .expect("B application egress must be available once");
+    let mut outcomes_c = runtime_c
+        .take_forward_outcomes()
+        .expect("C application egress must be available once");
 
     endpoint_a
         .connect(b, endpoint_b.local_addr())
@@ -113,10 +156,13 @@ async fn three_nodes_converge_over_real_loopback_tcp_links() {
         .expect("A-B TCP link must connect");
     wait_for_links(&endpoint_a, 1).await;
     wait_for_links(&endpoint_b, 1).await;
-    let first_pair_converged =
-        |snapshot: &RuntimeSnapshot| snapshot.lsdb_entries == 2 && snapshot.routes.len() == 1;
-    wait_for_snapshot(&mut snapshots_a, first_pair_converged).await;
-    wait_for_snapshot(&mut snapshots_b, first_pair_converged).await;
+    let first_hop = wait_for_routed_delivery(
+        &runtime_a,
+        &mut outcomes_b,
+        packet(a, b, Priority::P2, b"one-hop readiness"),
+    )
+    .await;
+    assert_eq!(first_hop.header.destination, b);
 
     // C joins after A and B have already converged. Link-up digest exchange
     // must transfer A's preexisting LSA across B without a fresh A update.
@@ -127,38 +173,35 @@ async fn three_nodes_converge_over_real_loopback_tcp_links() {
     wait_for_links(&endpoint_b, 2).await;
     wait_for_links(&endpoint_c, 1).await;
 
-    let converged =
-        |snapshot: &RuntimeSnapshot| snapshot.lsdb_entries == 3 && snapshot.routes.len() == 2;
-    let snapshot_a = wait_for_snapshot(&mut snapshots_a, converged).await;
-    let snapshot_b = wait_for_snapshot(&mut snapshots_b, converged).await;
-    let snapshot_c = wait_for_snapshot(&mut snapshots_c, converged).await;
+    let delivered = wait_for_routed_delivery(
+        &runtime_a,
+        &mut outcomes_c,
+        packet(a, c, Priority::P2, b"two-hop unicast"),
+    )
+    .await;
+    assert_eq!(delivered.header.source, a);
+    assert_eq!(delivered.header.destination, c);
+    assert_eq!(delivered.header.ttl, 30);
+    assert_eq!(delivered.payload, Bytes::from_static(b"two-hop unicast"));
 
-    let a_to_c = snapshot_a
-        .routes
-        .get(&c)
-        .expect("A must route to C through B");
-    assert_eq!(a_to_c.cost, 30);
-    assert_eq!(a_to_c.hops, 2);
-    assert_eq!(snapshot_a.peers.get(&a_to_c.next_hop), Some(&b));
-
-    let c_to_a = snapshot_c
-        .routes
-        .get(&a)
-        .expect("C must route to A through B");
-    assert_eq!(c_to_a.cost, 30);
-    assert_eq!(c_to_a.hops, 2);
-    assert_eq!(snapshot_c.peers.get(&c_to_a.next_hop), Some(&b));
+    runtime_a
+        .send_multicast(
+            vec![c, b],
+            packet(a, NodeId::default(), Priority::P1, b"branched multicast"),
+        )
+        .await
+        .expect("A must accept a multicast packet");
+    let delivered_b = wait_for_delivery(&mut outcomes_b).await;
+    let delivered_c = wait_for_delivery(&mut outcomes_c).await;
+    assert_eq!(delivered_b.header.destination, b);
+    assert_eq!(delivered_b.header.ttl, 31);
+    assert_eq!(delivered_c.header.destination, c);
+    assert_eq!(delivered_c.header.ttl, 30);
     assert_eq!(
-        snapshot_b.routes.get(&a).expect("B must route to A").hops,
-        1
+        delivered_b.payload,
+        Bytes::from_static(b"branched multicast")
     );
-    assert_eq!(
-        snapshot_b.routes.get(&c).expect("B must route to C").hops,
-        1
-    );
-    assert!(snapshot_a.persisted_seq > 0);
-    assert!(snapshot_b.persisted_seq > 0);
-    assert!(snapshot_c.persisted_seq > 0);
+    assert_eq!(delivered_c.payload, delivered_b.payload);
 
     runtime_a.shutdown().await;
     runtime_b.shutdown().await;

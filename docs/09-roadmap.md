@@ -44,16 +44,28 @@ A-D の直接リンクを追加 → A→E が 2 hop に変わる
 
 **目標**：多段ホップで任意ノードにパケットが届く。優先度が守られる。
 
+Phase 2 は、後続の決定論シミュレータへ進むために必要なデータプレーンのコアを完成させる段階とする。
+ECMP、診断 CLI、本格的なメトリクス公開は運用性・性能を高める機能だが、単一最短経路での正しい転送と
+QoS の成立には必須ではないため、この段階の完了条件から外して後続バックログへ送る。
+
 - [x] `mb-forward`：88 バイトヘッダ、転送ループ、TTL、ループ検知
 - [x] 優先度キュー（P0 厳密 + P1〜P3 DRR）
 - [x] Conflation
 - [x] Explicit Multicast の fan-out
 - [x] Link Down 時のキュー処理
-- [ ] ECMP と flow_id ハッシュ
-- [ ] `mbtool trace`（経路トレース、キュー待ち時間つき）
-- [ ] メトリクス：`mb_queue_depth_*`, `mb_queue_wait_seconds`, `mb_fwd_dropped_total`
+- [x] `mb-runtime` と TCP transport の接続（経路更新、Forward frame、timer、local delivery）
+- [x] byte credit（容量）と `LinkWritable`（1 packet の送信許可）を分離し、送信完了時に実送信 byte 数と次の許可を返すことで、transport の FIFO より手前で QoS 順序を決定
+- [x] 実 loopback TCP 上の A-B-C 多段ユニキャストと Explicit Multicast
 
-**判定**：帯域を `tc netem` で 100 kbps に絞り、P3 を飽和させた状態で P0 の p99 遅延が RTT + 100 ms 以内。
+**Phase 2 の判定**：実 TCP の 3 ノードでユニキャストと Multicast が配送され、有限 byte credit 下で
+P3 が滞留していても P0 が次の送信機会を先に得ることを決定論テストで確認する。
+
+**後続バックログ（Phase 2 の完了を妨げない）**：
+
+- ECMP と `flow_id` hash。単一経路の可用性・順序保証には不要であり、複数経路を使う段階で追加する
+- `mbtool trace`。Admin API / CLI の縦切りと一緒に追加する
+- Prometheus メトリクス：`mb_queue_depth_*`, `mb_queue_wait_seconds`, `mb_fwd_dropped_total`
+- Linux の `tc netem` で 100 kbps に制限した P0 p99 試験。Phase 3 の帯域 LinkModel で先に回帰検出を作り、実環境試験で追認する
 
 ## Phase 3 — シミュレータ（2 週）★ ここへの投資が後を決める
 

@@ -61,8 +61,12 @@ Anduril Lattice の DSB (Distributed Service Bus) / Lattice Mesh を公開情報
 - `mb-wire`: LSA/Digest protobuf、固定 8 byte Link header、固定 88 byte Forward header、1 MiB 上限、incremental decoder
 - `mb-forward`: `RouteTable` による I/O なしのユニキャスト転送、Explicit Multicast fan-out、Link Down 時の priority 別キュー処理と P0 の 2 秒経路待機、TTL、no-route、ループ検知、有限 priority queue、byte credit、P0 strict priority + P1〜P3 DRR、P1 Conflation
 - `mb-transport`: TLS なし・静的ピア限定の TCP adapter
-- `mb-runtime`: TCP と control の Event/Action、単調時刻 Timer、再起動をまたぐ seq 永続化を接続する Tokio glue
-- 仮想時刻による 5 ノードの経路収束・分断・短経路への再収束と、loopback TCP 上の動的な 3 ノード参加・経路収束テスト
+- `mb-runtime`: TCP と control / forwarding の Event/Action、単調時刻 Timer、再起動をまたぐ seq 永続化を接続する Tokio glue
+- Forward packet は Link ごとに 1 個だけ送信中とする。byte credit は送信可能容量、`LinkWritable` は 1 packet の送信許可として分離し、TCP 書き込み完了時に実送信 byte 数と次の許可を返すことで QoS 順序を transport FIFO の手前で確定
+- 仮想時刻による 5 ノードの経路収束・分断・短経路への再収束と、loopback TCP 上の動的な 3 ノード参加・経路収束・多段転送テスト
+
+Phase 2 は単一最短経路での多段転送、QoS、Multicast、Link Down 処理、runtime 接続を必須範囲として完了とする。
+ECMP、`mbtool trace`、Prometheus メトリクス、Linux `tc netem` の実環境性能試験は後続の強化項目として扱う。
 
 ```sh
 cargo test --workspace

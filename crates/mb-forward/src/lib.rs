@@ -40,10 +40,13 @@ pub enum ForwardEvent {
         packet: ForwardPacket,
     },
     RoutesUpdated(Arc<RouteTable>),
+    /// Adds byte capacity available to Forward packets on this link.
     LinkCredit {
         link: LinkId,
         bytes: usize,
     },
+    /// Grants permission to start at most one Forward-packet write.
+    LinkWritable(LinkId),
     LinkDown(LinkId),
     Timer(ForwardTimer),
 }
@@ -76,8 +79,9 @@ pub enum ForwardAction {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LinkQueueSnapshot {
+struct LinkQueueSnapshot {
     pub available_credit_bytes: usize,
     pub packet_counts: [usize; 4],
     pub queued_bytes: [usize; 4],
@@ -89,6 +93,7 @@ struct LinkQueues {
     queues: [VecDeque<QueuedPacket>; 4],
     queued_bytes: [usize; 4],
     available_credit_bytes: usize,
+    writable: bool,
     deficit_bytes: [usize; 3],
     next_drr: usize,
     drr_needs_quantum: bool,
@@ -131,6 +136,7 @@ impl Default for LinkQueues {
             queues: std::array::from_fn(|_| VecDeque::new()),
             queued_bytes: [0; 4],
             available_credit_bytes: 0,
+            writable: false,
             deficit_bytes: [0; 3],
             next_drr: 0,
             drr_needs_quantum: true,
@@ -174,7 +180,8 @@ impl Forwarder {
             .sum()
     }
 
-    pub fn queue_snapshot(&self, link: LinkId) -> Option<LinkQueueSnapshot> {
+    #[cfg(test)]
+    fn queue_snapshot(&self, link: LinkId) -> Option<LinkQueueSnapshot> {
         self.links.get(&link).map(|state| LinkQueueSnapshot {
             available_credit_bytes: state.available_credit_bytes,
             packet_counts: std::array::from_fn(|index| state.queues[index].len()),
@@ -363,7 +370,7 @@ impl Forwarder {
                 state.queued_bytes[queue_index] = state.queued_bytes[queue_index]
                     .saturating_sub(previous_len)
                     .saturating_add(replacement_len);
-                return self.drain_link(link);
+                return self.try_send_one(link);
             }
         }
 
@@ -381,7 +388,7 @@ impl Forwarder {
         state.queued_bytes[queue_index] =
             state.queued_bytes[queue_index].saturating_add(packet.encoded_len());
         state.queues[queue_index].push_back(QueuedPacket { incoming, packet });
-        self.drain_link(link)
+        self.try_send_one(link)
     }
 
     fn grant_credit(&mut self, link: LinkId, bytes: usize) -> Vec<ForwardAction> {
@@ -390,42 +397,52 @@ impl Forwarder {
         }
         let state = self.links.entry(link).or_default();
         state.available_credit_bytes = state.available_credit_bytes.saturating_add(bytes);
-        self.drain_link(link)
+        self.try_send_one(link)
     }
 
-    fn drain_link(&mut self, link: LinkId) -> Vec<ForwardAction> {
+    fn mark_writable(&mut self, link: LinkId) -> Vec<ForwardAction> {
+        if self.down_links.contains(&link) {
+            return Vec::new();
+        }
+        self.links.entry(link).or_default().writable = true;
+        self.try_send_one(link)
+    }
+
+    fn try_send_one(&mut self, link: LinkId) -> Vec<ForwardAction> {
         let Some(state) = self.links.get_mut(&link) else {
             return Vec::new();
         };
-        let mut actions = Vec::new();
+        if !state.writable {
+            return Vec::new();
+        }
+
+        if let Some(packet_len) = state.queues[0]
+            .front()
+            .map(|queued| queued.packet.encoded_len())
+        {
+            if packet_len > state.available_credit_bytes {
+                return Vec::new();
+            }
+            let queued = state.queues[0]
+                .pop_front()
+                .expect("P0 queue front was checked");
+            state.queued_bytes[0] = state.queued_bytes[0].saturating_sub(packet_len);
+            state.available_credit_bytes -= packet_len;
+            state.writable = false;
+            return vec![ForwardAction::Send {
+                link,
+                packet: queued.packet,
+            }];
+        }
 
         loop {
-            if let Some(packet_len) = state.queues[0]
-                .front()
-                .map(|queued| queued.packet.encoded_len())
-            {
-                if packet_len > state.available_credit_bytes {
-                    break;
-                }
-                let queued = state.queues[0]
-                    .pop_front()
-                    .expect("P0 queue front was checked");
-                state.queued_bytes[0] = state.queued_bytes[0].saturating_sub(packet_len);
-                state.available_credit_bytes -= packet_len;
-                actions.push(ForwardAction::Send {
-                    link,
-                    packet: queued.packet,
-                });
-                continue;
-            }
-
             let a_packet_fits_credit = state.queues[1..].iter().any(|queue| {
                 queue.front().is_some_and(|queued| {
                     queued.packet.encoded_len() <= state.available_credit_bytes
                 })
             });
             if !a_packet_fits_credit {
-                break;
+                return Vec::new();
             }
 
             let drr_index = state.next_drr;
@@ -460,17 +477,16 @@ impl Forwarder {
             state.queued_bytes[queue_index] =
                 state.queued_bytes[queue_index].saturating_sub(packet_len);
             state.available_credit_bytes -= packet_len;
-            actions.push(ForwardAction::Send {
-                link,
-                packet: queued.packet,
-            });
+            state.writable = false;
             if state.queues[queue_index].is_empty() {
                 state.deficit_bytes[drr_index] = 0;
                 advance_drr(state);
             }
+            return vec![ForwardAction::Send {
+                link,
+                packet: queued.packet,
+            }];
         }
-
-        actions
     }
 
     fn handle_link_down(&mut self, now: MonoTime, link: LinkId) -> Vec<ForwardAction> {
@@ -720,6 +736,7 @@ fn priority_index(priority: Priority) -> usize {
     priority as usize
 }
 
+#[cfg(test)]
 fn drr_priority(index: usize) -> Priority {
     match index {
         0 => Priority::P1,
@@ -748,6 +765,7 @@ impl Component for Forwarder {
             ForwardEvent::Inbound { link, packet } => self.process_packet(Some(link), packet),
             ForwardEvent::RoutesUpdated(routes) => self.handle_routes_updated(now, routes),
             ForwardEvent::LinkCredit { link, bytes } => self.grant_credit(link, bytes),
+            ForwardEvent::LinkWritable(link) => self.mark_writable(link),
             ForwardEvent::LinkDown(link) => self.handle_link_down(now, link),
             ForwardEvent::Timer(timer) => self.handle_timer(now, timer),
         }
@@ -869,6 +887,9 @@ mod tests {
                 },
             )
             .is_empty());
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::LinkWritable(link))
+            .is_empty());
     }
 
     fn one_action(actions: Vec<ForwardAction>) -> ForwardAction {
@@ -920,6 +941,12 @@ mod tests {
                     bytes: original.encoded_len(),
                 },
             )
+            .is_empty());
+        assert!(forwarder_a
+            .handle(MonoTime::ZERO, ForwardEvent::LinkWritable(a_to_b))
+            .is_empty());
+        assert!(forwarder_b
+            .handle(MonoTime::ZERO, ForwardEvent::LinkWritable(b_to_c))
             .is_empty());
 
         let at_b = expect_send(
@@ -1069,6 +1096,9 @@ mod tests {
                 },
             )
             .is_empty());
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::LinkWritable(outgoing))
+            .is_empty());
         let body = Bytes::from_static(b"isolated body");
         let inbound = encoded_multicast_packet(
             source,
@@ -1127,6 +1157,9 @@ mod tests {
                             bytes: usize::MAX,
                         },
                     )
+                    .is_empty());
+                assert!(forwarder
+                    .handle(MonoTime::ZERO, ForwardEvent::LinkWritable(link))
                     .is_empty());
             }
             forwarder.handle(
@@ -1715,6 +1748,9 @@ mod tests {
                 },
             )
             .is_empty());
+        assert!(forwarder
+            .handle(MonoTime::from_millis(1), ForwardEvent::LinkWritable(link),)
+            .is_empty());
 
         let sent = expect_send(
             one_action(
@@ -1740,6 +1776,7 @@ mod tests {
                     bytes: packet(a, b, 32).encoded_len(),
                 },
             ));
+            actions.extend(forwarder.handle(MonoTime::ZERO, ForwardEvent::LinkWritable(link)));
             actions.extend(forwarder.handle(
                 MonoTime::from_millis(1),
                 ForwardEvent::Outbound(packet(a, b, 32)),
@@ -1773,6 +1810,10 @@ mod tests {
         );
 
         assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::LinkWritable(link))
+            .is_empty());
+
+        assert!(forwarder
             .handle(
                 MonoTime::from_millis(1),
                 ForwardEvent::LinkCredit {
@@ -1793,6 +1834,54 @@ mod tests {
         assert_eq!(snapshot.available_credit_bytes, 0);
         assert_eq!(snapshot.packet_counts, [0; 4]);
         assert_eq!(snapshot.queued_bytes, [0; 4]);
+    }
+
+    #[test]
+    fn one_writable_event_releases_at_most_one_packet() {
+        let [a, b] = [node(1), node(2)];
+        let link = LinkId::new(1);
+        let mut forwarder = Forwarder::new(a, route_table([(b, link, 10, 1)]));
+        let first = packet(a, b, 32);
+        let mut second = packet(a, b, 32);
+        second.header.flow_id = 2;
+
+        for queued in [first.clone(), second.clone()] {
+            assert!(forwarder
+                .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+                .is_empty());
+        }
+        assert!(forwarder
+            .handle(
+                MonoTime::ZERO,
+                ForwardEvent::LinkCredit {
+                    link,
+                    bytes: first.encoded_len() + second.encoded_len(),
+                },
+            )
+            .is_empty());
+
+        let sent = expect_send(
+            one_action(
+                forwarder.handle(MonoTime::from_millis(1), ForwardEvent::LinkWritable(link)),
+            ),
+            link,
+        );
+        assert_eq!(sent.header.flow_id, first.header.flow_id);
+        assert_eq!(
+            forwarder
+                .queue_snapshot(link)
+                .expect("second packet must remain queued")
+                .packet_counts,
+            [0, 1, 0, 0]
+        );
+
+        let sent = expect_send(
+            one_action(
+                forwarder.handle(MonoTime::from_millis(2), ForwardEvent::LinkWritable(link)),
+            ),
+            link,
+        );
+        assert_eq!(sent.header.flow_id, second.header.flow_id);
     }
 
     #[test]
@@ -1818,6 +1907,9 @@ mod tests {
             let before = forwarder
                 .queue_snapshot(link)
                 .expect("conflated packet must remain queued");
+            assert!(forwarder
+                .handle(MonoTime::from_millis(1), ForwardEvent::LinkWritable(link))
+                .is_empty());
             let actions = forwarder.handle(
                 MonoTime::from_millis(1),
                 ForwardEvent::LinkCredit {
@@ -1891,13 +1983,19 @@ mod tests {
             replacement.encoded_len() + second.encoded_len()
         );
 
-        let actions = forwarder.handle(
-            MonoTime::from_millis(1),
-            ForwardEvent::LinkCredit {
-                link,
-                bytes: replacement.encoded_len() + second.encoded_len(),
-            },
-        );
+        assert!(forwarder
+            .handle(
+                MonoTime::from_millis(1),
+                ForwardEvent::LinkCredit {
+                    link,
+                    bytes: replacement.encoded_len() + second.encoded_len(),
+                },
+            )
+            .is_empty());
+        let mut actions =
+            forwarder.handle(MonoTime::from_millis(1), ForwardEvent::LinkWritable(link));
+        actions
+            .extend(forwarder.handle(MonoTime::from_millis(2), ForwardEvent::LinkWritable(link)));
         assert_eq!(actions.len(), 2);
         let sent_payloads = actions
             .into_iter()
@@ -2015,15 +2113,20 @@ mod tests {
         assert!(forwarder
             .handle(MonoTime::ZERO, ForwardEvent::Outbound(p0))
             .is_empty());
-
-        let first = expect_send(
-            one_action(forwarder.handle(
+        assert!(forwarder
+            .handle(
                 MonoTime::from_millis(1),
                 ForwardEvent::LinkCredit {
                     link,
                     bytes: packet_len,
                 },
-            )),
+            )
+            .is_empty());
+
+        let first = expect_send(
+            one_action(
+                forwarder.handle(MonoTime::from_millis(1), ForwardEvent::LinkWritable(link)),
+            ),
             link,
         );
         assert_eq!(first.header.priority, Priority::P0);
@@ -2035,14 +2138,19 @@ mod tests {
             [0, 0, 0, 1]
         );
 
-        let second = expect_send(
-            one_action(forwarder.handle(
+        assert!(forwarder
+            .handle(
                 MonoTime::from_millis(2),
                 ForwardEvent::LinkCredit {
                     link,
                     bytes: packet_len,
                 },
-            )),
+            )
+            .is_empty());
+        let second = expect_send(
+            one_action(
+                forwarder.handle(MonoTime::from_millis(2), ForwardEvent::LinkWritable(link)),
+            ),
             link,
         );
         assert_eq!(second.header.priority, Priority::P3);
@@ -2069,13 +2177,24 @@ mod tests {
             }
         }
 
-        let actions = forwarder.handle(
-            MonoTime::from_millis(1),
-            ForwardEvent::LinkCredit {
-                link,
-                bytes: total_bytes,
-            },
-        );
+        assert!(forwarder
+            .handle(
+                MonoTime::from_millis(1),
+                ForwardEvent::LinkCredit {
+                    link,
+                    bytes: total_bytes,
+                },
+            )
+            .is_empty());
+        let mut actions = Vec::new();
+        for sequence in 0..9 {
+            let released = forwarder.handle(
+                MonoTime::from_millis(2 + sequence),
+                ForwardEvent::LinkWritable(link),
+            );
+            assert_eq!(released.len(), 1);
+            actions.extend(released);
+        }
         let sent_priorities = actions
             .iter()
             .map(|action| match action {

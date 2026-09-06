@@ -194,6 +194,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "mb-control",
+ "mb-forward",
  "mb-transport",
  "mb-types",
  "mb-wire",

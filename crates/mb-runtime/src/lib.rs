@@ -1,14 +1,18 @@
-//! Tokio glue that drives the I/O-free control plane from transport events.
+//! Tokio glue that drives the I/O-free control and forwarding planes.
 
 use bytes::Bytes;
 use mb_control::{
     Adjacency, ControlAction, ControlEvent, ControlFrame, ControlPlane, ControlTimer, DigestEntry,
-    InvalidLinkCost, LinkCost, Lsa, LsaMessage, RouteTable, MAX_DIGEST_ENTRIES,
-    MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSA_TTL_SEC,
+    InvalidLinkCost, LinkCost, Lsa, LsaMessage, MAX_DIGEST_ENTRIES, MAX_DIGEST_REQ_ORIGINS,
+    MAX_LSA_ADJACENCIES, MAX_LSA_TTL_SEC,
 };
+use mb_forward::{DropReason, ForwardAction, ForwardEvent, ForwardTimer, Forwarder};
 use mb_transport::{LinkEvent, TcpEndpoint, TransportError};
 use mb_types::{Component, LinkId, MonoTime, NodeId};
-use mb_wire::{proto, Channel, FrameType, WireFrame};
+use mb_wire::{
+    proto, Channel, ForwardPacket, ForwardPacketCodec, ForwardPacketError, FrameType, PacketType,
+    Priority, WireFrame, MAX_PAYLOAD_LEN,
+};
 use prost::Message;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
@@ -18,9 +22,12 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
+
+const FORWARD_INPUT_CAPACITY: usize = 256;
+const FORWARD_OUTCOME_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeqStoreError(String);
@@ -163,13 +170,31 @@ pub struct RuntimeConfig {
     pub peer_costs: BTreeMap<NodeId, LinkCost>,
 }
 
-#[derive(Clone, Debug)]
-pub struct RuntimeSnapshot {
-    pub node_id: NodeId,
-    pub lsdb_entries: usize,
-    pub routes: Arc<RouteTable>,
-    pub persisted_seq: u64,
-    pub peers: BTreeMap<LinkId, NodeId>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ForwardOutcome {
+    Delivered(ForwardPacket),
+    Dropped {
+        reason: DropReason,
+        packet: ForwardPacket,
+    },
+    Backpressure {
+        link: LinkId,
+        packet: ForwardPacket,
+    },
+}
+
+enum ForwardInput {
+    Outbound(ForwardPacket),
+    OutboundMulticast {
+        destinations: Vec<NodeId>,
+        packet: ForwardPacket,
+    },
+}
+
+struct RuntimeChannels {
+    link_events: mpsc::Receiver<LinkEvent>,
+    forward_inputs: mpsc::Receiver<ForwardInput>,
+    forward_outcomes: mpsc::Sender<ForwardOutcome>,
 }
 
 #[derive(Debug)]
@@ -192,6 +217,8 @@ pub enum RuntimeError {
         limit: usize,
     },
     SequenceExhausted,
+    ForwardPacket(ForwardPacketError),
+    RuntimeStopped,
     SeqStore(SeqStoreError),
     Transport(TransportError),
 }
@@ -225,6 +252,8 @@ impl fmt::Display for RuntimeError {
                 limit,
             } => write!(f, "{field} contains {count} elements, limit is {limit}"),
             Self::SequenceExhausted => f.write_str("LSA sequence is exhausted"),
+            Self::ForwardPacket(error) => write!(f, "forward packet is invalid: {error}"),
+            Self::RuntimeStopped => f.write_str("runtime has stopped"),
             Self::SeqStore(error) => write!(f, "sequence persistence failed: {error}"),
             Self::Transport(error) => write!(f, "transport operation failed: {error}"),
         }
@@ -235,6 +264,7 @@ impl Error for RuntimeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Protobuf(error) => Some(error),
+            Self::ForwardPacket(error) => Some(error),
             Self::SeqStore(error) => Some(error),
             Self::Transport(error) => Some(error),
             _ => None,
@@ -254,16 +284,23 @@ impl From<TransportError> for RuntimeError {
     }
 }
 
+impl From<ForwardPacketError> for RuntimeError {
+    fn from(value: ForwardPacketError) -> Self {
+        Self::ForwardPacket(value)
+    }
+}
+
 impl From<SeqStoreError> for RuntimeError {
     fn from(value: SeqStoreError) -> Self {
         Self::SeqStore(value)
     }
 }
 
-/// Handle for observing and stopping one control-plane runtime.
+/// Handle for sending packets, observing state, and stopping one mesh runtime.
 pub struct ControlRuntime {
     endpoint: TcpEndpoint,
-    snapshots: watch::Receiver<RuntimeSnapshot>,
+    forward_inputs: mpsc::Sender<ForwardInput>,
+    forward_outcomes: Option<mpsc::Receiver<ForwardOutcome>>,
     driver: JoinHandle<()>,
 }
 
@@ -300,37 +337,60 @@ impl ControlRuntime {
         }
         let plane =
             ControlPlane::new_unsecured_with_seq(config.node_id, config.epoch, persisted_seq);
-        let initial = RuntimeSnapshot {
-            node_id: config.node_id,
-            lsdb_entries: plane.lsdb_len(),
-            routes: plane.route_table(),
-            persisted_seq,
-            peers: BTreeMap::new(),
-        };
-        let (snapshot_tx, snapshots) = watch::channel(initial);
+        let (forward_input_tx, forward_input_rx) = mpsc::channel(FORWARD_INPUT_CAPACITY);
+        let (forward_outcome_tx, forward_outcome_rx) = mpsc::channel(FORWARD_OUTCOME_CAPACITY);
         let driver_endpoint = endpoint.clone();
-        let driver = tokio::spawn(run_control_loop(
+        let channels = RuntimeChannels {
+            link_events: events,
+            forward_inputs: forward_input_rx,
+            forward_outcomes: forward_outcome_tx,
+        };
+        let driver = tokio::spawn(run_runtime_loop(
             config,
             plane,
             driver_endpoint,
-            events,
-            snapshot_tx,
+            channels,
             seq_store,
-            persisted_seq,
         ));
         Ok(Self {
             endpoint,
-            snapshots,
+            forward_inputs: forward_input_tx,
+            forward_outcomes: Some(forward_outcome_rx),
             driver,
         })
     }
 
-    pub fn snapshot(&self) -> RuntimeSnapshot {
-        self.snapshots.borrow().clone()
+    /// Transfers the reliable, single-consumer application egress to the
+    /// caller. Pub/Sub or another upper layer should drain this receiver.
+    pub fn take_forward_outcomes(&mut self) -> Option<mpsc::Receiver<ForwardOutcome>> {
+        self.forward_outcomes.take()
     }
 
-    pub fn subscribe(&self) -> watch::Receiver<RuntimeSnapshot> {
-        self.snapshots.clone()
+    pub async fn send(&self, packet: ForwardPacket) -> Result<(), RuntimeError> {
+        ForwardPacketCodec::encode(&packet)?;
+        self.forward_inputs
+            .send(ForwardInput::Outbound(packet))
+            .await
+            .map_err(|_| RuntimeError::RuntimeStopped)
+    }
+
+    pub async fn send_multicast(
+        &self,
+        destinations: Vec<NodeId>,
+        packet: ForwardPacket,
+    ) -> Result<(), RuntimeError> {
+        let mut validation = packet.clone();
+        validation.header.packet_type = PacketType::Multicast;
+        validation.header.destination = NodeId::default();
+        validation.multicast_destinations = destinations.clone();
+        ForwardPacketCodec::encode(&validation)?;
+        self.forward_inputs
+            .send(ForwardInput::OutboundMulticast {
+                destinations,
+                packet,
+            })
+            .await
+            .map_err(|_| RuntimeError::RuntimeStopped)
     }
 
     pub async fn shutdown(self) {
@@ -340,84 +400,180 @@ impl ControlRuntime {
     }
 }
 
-async fn run_control_loop(
+async fn run_runtime_loop(
     config: RuntimeConfig,
     mut plane: ControlPlane,
     endpoint: TcpEndpoint,
-    mut events: mpsc::Receiver<LinkEvent>,
-    snapshots: watch::Sender<RuntimeSnapshot>,
+    channels: RuntimeChannels,
     seq_store: Arc<dyn SeqStore>,
-    mut persisted_seq: u64,
 ) {
+    let RuntimeChannels {
+        link_events,
+        forward_inputs,
+        forward_outcomes,
+    } = channels;
+    let mut events = link_events;
+    let mut forward_inputs = forward_inputs;
     let started_at = Instant::now();
-    let mut peers = BTreeMap::new();
-    let mut timers = BinaryHeap::<Reverse<(u64, u64, ControlTimer)>>::new();
+    let mut forwarder = Forwarder::new(config.node_id, plane.route_table());
+    let mut timers = BinaryHeap::<Reverse<(u64, u64, RuntimeTimer)>>::new();
     let mut next_timer_sequence = 0_u64;
 
     loop {
-        let Some(input) = next_runtime_input(started_at, &mut events, &mut timers).await else {
+        let Some(input) =
+            next_runtime_input(started_at, &mut events, &mut forward_inputs, &mut timers).await
+        else {
             break;
         };
 
-        let event = match input {
-            RuntimeInput::Timer(timer) => ControlEvent::Timer(timer),
-            RuntimeInput::Link(link_event) => {
-                let Some(event) =
-                    translate_link_event(&config, &endpoint, &mut peers, link_event).await
-                else {
+        let now = MonoTime::from_millis(elapsed_millis(started_at));
+        let mut control_event = None;
+        let mut forward_actions = Vec::new();
+
+        match input {
+            RuntimeInput::Timer(RuntimeTimer::Control(timer)) => {
+                control_event = Some(ControlEvent::Timer(timer));
+            }
+            RuntimeInput::Timer(RuntimeTimer::Forward(timer)) => {
+                forward_actions.extend(forwarder.handle(now, ForwardEvent::Timer(timer)));
+            }
+            RuntimeInput::Forward(ForwardInput::Outbound(packet)) => {
+                forward_actions.extend(forwarder.handle(now, ForwardEvent::Outbound(packet)));
+            }
+            RuntimeInput::Forward(ForwardInput::OutboundMulticast {
+                destinations,
+                packet,
+            }) => {
+                forward_actions.extend(forwarder.handle(
+                    now,
+                    ForwardEvent::OutboundMulticast {
+                        destinations,
+                        packet,
+                    },
+                ));
+            }
+            RuntimeInput::Link(LinkEvent::Up { link, peer }) => {
+                let Some(cost) = config.peer_costs.get(&peer).copied() else {
+                    let _ = endpoint.close(link).await;
                     continue;
                 };
-                event
+                forward_actions.extend(forwarder.handle(
+                    now,
+                    ForwardEvent::LinkCredit {
+                        link,
+                        bytes: MAX_PAYLOAD_LEN,
+                    },
+                ));
+                forward_actions.extend(forwarder.handle(now, ForwardEvent::LinkWritable(link)));
+                control_event = Some(ControlEvent::LinkUp { link, peer, cost });
             }
-        };
-
-        let now_ms = elapsed_millis(started_at);
-        let actions = plane.handle(MonoTime::from_millis(now_ms), event);
-        for action in actions {
-            match action {
-                ControlAction::Send { link, frame } => {
-                    let Ok(wire_frame) = encode_control_frame(&frame) else {
-                        continue;
-                    };
-                    if endpoint.send(link, wire_frame).await.is_err() {
-                        let _ = endpoint.close(link).await;
+            RuntimeInput::Link(LinkEvent::Down { link }) => {
+                forward_actions.extend(forwarder.handle(now, ForwardEvent::LinkDown(link)));
+                control_event = Some(ControlEvent::LinkDown { link });
+            }
+            RuntimeInput::Link(LinkEvent::Frame { link, frame }) => {
+                if frame.frame_type == FrameType::Forward {
+                    match decode_forward_frame(frame) {
+                        Ok(packet) => forward_actions
+                            .extend(forwarder.handle(now, ForwardEvent::Inbound { link, packet })),
+                        Err(_) => {
+                            let _ = endpoint.close(link).await;
+                            continue;
+                        }
+                    }
+                } else {
+                    match decode_control_frame(frame) {
+                        Ok(frame) => {
+                            control_event = Some(ControlEvent::Frame { link, frame });
+                        }
+                        Err(_) => {
+                            let _ = endpoint.close(link).await;
+                            continue;
+                        }
                     }
                 }
-                ControlAction::SetTimer { timer, at } => {
-                    timers.push(Reverse((at.as_millis(), next_timer_sequence, timer)));
-                    next_timer_sequence = next_timer_sequence.wrapping_add(1);
-                }
-                ControlAction::PublishRoutes(_) => {}
-                ControlAction::PersistSeq(seq) => {
-                    let store = Arc::clone(&seq_store);
-                    let stored = tokio::task::spawn_blocking(move || store.persist(seq)).await;
-                    if !matches!(stored, Ok(Ok(()))) {
-                        return;
-                    }
-                    persisted_seq = seq;
+            }
+            RuntimeInput::Link(LinkEvent::Sent {
+                link,
+                frame_type,
+                payload_bytes,
+                ..
+            }) => {
+                if frame_type == FrameType::Forward {
+                    forward_actions.extend(forwarder.handle(
+                        now,
+                        ForwardEvent::LinkCredit {
+                            link,
+                            bytes: payload_bytes,
+                        },
+                    ));
+                    forward_actions.extend(forwarder.handle(now, ForwardEvent::LinkWritable(link)));
                 }
             }
         }
 
-        snapshots.send_replace(RuntimeSnapshot {
-            node_id: config.node_id,
-            lsdb_entries: plane.lsdb_len(),
-            routes: plane.route_table(),
-            persisted_seq,
-            peers: peers.clone(),
-        });
+        if let Some(event) = control_event {
+            for action in plane.handle(now, event) {
+                match action {
+                    ControlAction::Send { link, frame } => {
+                        let Ok(wire_frame) = encode_control_frame(&frame) else {
+                            continue;
+                        };
+                        if endpoint.send(link, wire_frame).await.is_err() {
+                            let _ = endpoint.close(link).await;
+                        }
+                    }
+                    ControlAction::SetTimer { timer, at } => {
+                        timers.push(Reverse((
+                            at.as_millis(),
+                            next_timer_sequence,
+                            RuntimeTimer::Control(timer),
+                        )));
+                        next_timer_sequence = next_timer_sequence.wrapping_add(1);
+                    }
+                    ControlAction::PublishRoutes(routes) => {
+                        forward_actions
+                            .extend(forwarder.handle(now, ForwardEvent::RoutesUpdated(routes)));
+                    }
+                    ControlAction::PersistSeq(seq) => {
+                        let store = Arc::clone(&seq_store);
+                        let stored = tokio::task::spawn_blocking(move || store.persist(seq)).await;
+                        if !matches!(stored, Ok(Ok(()))) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        execute_forward_actions(
+            &endpoint,
+            &forward_outcomes,
+            &mut timers,
+            &mut next_timer_sequence,
+            forward_actions,
+        )
+        .await;
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RuntimeTimer {
+    Control(ControlTimer),
+    Forward(ForwardTimer),
 }
 
 enum RuntimeInput {
     Link(LinkEvent),
-    Timer(ControlTimer),
+    Forward(ForwardInput),
+    Timer(RuntimeTimer),
 }
 
 async fn next_runtime_input(
     started_at: Instant,
     events: &mut mpsc::Receiver<LinkEvent>,
-    timers: &mut BinaryHeap<Reverse<(u64, u64, ControlTimer)>>,
+    forward_inputs: &mut mpsc::Receiver<ForwardInput>,
+    timers: &mut BinaryHeap<Reverse<(u64, u64, RuntimeTimer)>>,
 ) -> Option<RuntimeInput> {
     if let Some(Reverse((at_ms, _, timer))) = timers.peek().copied() {
         if at_ms <= elapsed_millis(started_at) {
@@ -429,6 +585,7 @@ async fn next_runtime_input(
     let next_timer_at = timers.peek().map(|Reverse((at_ms, _, _))| *at_ms);
     tokio::select! {
         link_event = events.recv() => link_event.map(RuntimeInput::Link),
+        forward_input = forward_inputs.recv() => forward_input.map(RuntimeInput::Forward),
         _ = wait_for_timer(started_at, next_timer_at) => {
             let Reverse((_, _, timer)) = timers.pop()?;
             Some(RuntimeInput::Timer(timer))
@@ -449,33 +606,78 @@ fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-async fn translate_link_event(
-    config: &RuntimeConfig,
+async fn execute_forward_actions(
     endpoint: &TcpEndpoint,
-    peers: &mut BTreeMap<LinkId, NodeId>,
-    event: LinkEvent,
-) -> Option<ControlEvent> {
-    match event {
-        LinkEvent::Up { link, peer } => {
-            let Some(cost) = config.peer_costs.get(&peer).copied() else {
-                let _ = endpoint.close(link).await;
-                return None;
-            };
-            peers.insert(link, peer);
-            Some(ControlEvent::LinkUp { link, peer, cost })
-        }
-        LinkEvent::Down { link } => {
-            peers.remove(&link);
-            Some(ControlEvent::LinkDown { link })
-        }
-        LinkEvent::Frame { link, frame } => match decode_control_frame(frame) {
-            Ok(frame) => Some(ControlEvent::Frame { link, frame }),
-            Err(_) => {
-                let _ = endpoint.close(link).await;
-                None
+    outcomes: &mpsc::Sender<ForwardOutcome>,
+    timers: &mut BinaryHeap<Reverse<(u64, u64, RuntimeTimer)>>,
+    next_timer_sequence: &mut u64,
+    actions: Vec<ForwardAction>,
+) {
+    for action in actions {
+        match action {
+            ForwardAction::Send { link, packet } => {
+                let Ok(payload) = ForwardPacketCodec::encode(&packet) else {
+                    continue;
+                };
+                let frame = WireFrame {
+                    frame_type: FrameType::Forward,
+                    channel: channel_for_priority(packet.header.priority),
+                    payload,
+                };
+                if endpoint.send(link, frame).await.is_err() {
+                    let _ = endpoint.close(link).await;
+                }
             }
-        },
+            ForwardAction::DeliverLocal(packet) => {
+                let _ = outcomes.send(ForwardOutcome::Delivered(packet)).await;
+            }
+            ForwardAction::Drop { reason, packet } => {
+                let _ = outcomes
+                    .send(ForwardOutcome::Dropped { reason, packet })
+                    .await;
+            }
+            ForwardAction::Backpressure { link, packet } => {
+                let _ = outcomes
+                    .send(ForwardOutcome::Backpressure { link, packet })
+                    .await;
+            }
+            ForwardAction::SetTimer { timer, at } => {
+                timers.push(Reverse((
+                    at.as_millis(),
+                    *next_timer_sequence,
+                    RuntimeTimer::Forward(timer),
+                )));
+                *next_timer_sequence = next_timer_sequence.wrapping_add(1);
+            }
+        }
     }
+}
+
+fn channel_for_priority(priority: Priority) -> Channel {
+    match priority {
+        Priority::P0 => Channel::PubSubP0,
+        Priority::P1 => Channel::PubSubP1,
+        Priority::P2 => Channel::PubSubP2,
+        Priority::P3 => Channel::PubSubP3,
+    }
+}
+
+fn decode_forward_frame(frame: WireFrame) -> Result<ForwardPacket, RuntimeError> {
+    if frame.frame_type != FrameType::Forward {
+        return Err(RuntimeError::UnexpectedFrame {
+            frame_type: frame.frame_type,
+            channel: frame.channel,
+        });
+    }
+    let channel = frame.channel;
+    let packet = ForwardPacketCodec::decode(frame.payload)?;
+    if channel != channel_for_priority(packet.header.priority) {
+        return Err(RuntimeError::UnexpectedFrame {
+            frame_type: FrameType::Forward,
+            channel,
+        });
+    }
+    Ok(packet)
 }
 
 fn encode_control_frame(frame: &ControlFrame) -> Result<WireFrame, RuntimeError> {

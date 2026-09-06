@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 bytes.workspace = true
 mb-control = { path = "../mb-control" }
+mb-forward = { path = "../mb-forward" }
 mb-transport = { path = "../mb-transport" }
 mb-types = { path = "../mb-types" }
 mb-wire = { path = "../mb-wire" }

@@ -70,19 +70,38 @@ recv(Link L, pkt)
 **厳密優先（P0）+ 重み付き DRR（P1〜P3）**。
 
 ```text
-loop:
-  credit = link.send_credit()
-  if credit == 0: wait
-  if !q[P0].empty(): send(q[P0].pop()); continue
+on LinkCredit(bytes):
+  available_credit += bytes
+  try_send_one()
+
+on LinkWritable:
+  writable = true
+  try_send_one()
+
+try_send_one:
+  if !writable: return
+  if !q[P0].empty():
+      if head_size(q[P0]) <= available_credit:
+          send(q[P0].pop())
+          available_credit -= packet_size
+          writable = false
+      return
   // DRR: P1:P2:P3 = 70:25:5 (quantum bytes)
   for cls in round_robin([P1,P2,P3]):
       deficit[cls] += quantum[cls]
-      while deficit[cls] >= head_size(q[cls]) && !q[cls].empty():
-          send(q[cls].pop()); deficit[cls] -= size
+      if deficit[cls] >= head_size(q[cls]) && head_size(q[cls]) <= available_credit:
+          send(q[cls].pop())
+          deficit[cls] -= packet_size
+          available_credit -= packet_size
+          writable = false
+          return
 ```
 
 - P0 を厳密優先にする理由：C2 コマンドと経路更新は遅延が致命的。P0 の総量はレート制限（§6）で抑えるので飢餓は起こさない
 - P3 の重み 5% は「他が空いていれば全帯域を使える」DRR の性質で、実質「余り帯域」を使うことになる
+- `LinkCredit` は byte 単位の送信可能容量だけを表す。次の packet サイズをキューから覗いて生成しない
+- `LinkWritable` は transport writer が次の Forward packet を 1 個受け付けられることを表す。credit が十分でも、この許可 1 回につき `Send` は最大 1 個
+- TCP runtime は Link Up 時に最大 Forward payload 1 個分の初期 credit と `LinkWritable` を与える。Forward frame の書き込み完了時に、実際に書いた payload byte 数を credit へ戻し、次の `LinkWritable` を与える
 - 重みはリンク種別で変える設定を持つ（SATCOM では P3 を 1% に）
 
 ### 4.3 Conflation（P1）
@@ -115,7 +134,9 @@ Pub/Sub の配信は「1 メッセージを N 購読ノードへ」だが、経�
 
 ### 6.1 ホップ間
 
-Link の `send_credit()`（01）が 0 なら QoS キューに留まる。QUIC のストリームフロー制御がその下で働く。
+byte credit が packet サイズ未満、または `LinkWritable` がない場合は QoS キューに留まる。Phase 2 の TCP
+runtime では Link ごとに Forward packet を最大 1 個だけ送信中にし、書き込み完了時に実送信 byte 数と次の
+送信許可を返す。QUIC 化する場合も、下位のフロー制御から同じ 2 種類のイベントへ変換する。
 
 ### 6.2 端-端（多段ホップ）
 
@@ -150,7 +171,8 @@ pub enum ForwardEvent {
     Inbound  { link: LinkId, pkt: Packet },
     Outbound { pkt: Packet },                      // 上位層から
     OutboundMulticast { dsts: Vec<NodeId>, pkt: Packet },
-    LinkCredit { link: LinkId, credit: usize },    // 送信可能になった通知
+    LinkCredit { link: LinkId, bytes: usize },     // byte 単位の送信可能容量を追加
+    LinkWritable(LinkId),                          // Forward packet 1 個の送信許可
     RoutesUpdated(Arc<RouteTable>),
     LinkDown(LinkId),                              // そのリンクのキューを再ルーティング or drop
     Timer(ForwardTimer),                           // P0 の no-route 保留タイムアウト
@@ -196,3 +218,15 @@ pub struct Forwarder {
 | ループしない | ランダムトポロジで ttl_exceeded カウントが 0（経路収束後） |
 | Multicast：各リンクに同一メッセージが 1 回しか流れない | 送信元 1、購読者 20 で全リンクの送信カウントを検証 |
 | Link Down 時の P0 保全 | 迂回路があるとき P0 の損失 0 |
+
+## 11. 学習用 MVP の完了範囲
+
+Phase 2 の必須範囲は、単一最短経路での多段転送、有限キューと byte credit による QoS、Conflation、
+Explicit Multicast、Link Down 処理、および実 TCP runtime との接続までとする。Link ごとに Forward packet を
+1 個だけ送信中にする。byte credit（容量）と `LinkWritable`（1 packet の送信許可）は別に管理し、書き込み
+完了後は実送信 byte 数を credit に戻して次の許可を与える。scheduler は許可ごとに最大 1 packet だけ選ぶ。
+これにより transport 内の FIFO に P3 を先行蓄積せず、P0 strict priority を実送信順まで維持する。
+
+ECMP と `flow_id` hash、`mbtool trace`、Prometheus 公開は必須コアの正しさを変えないため後続へ延期する。
+100 kbps の Linux `tc netem` 試験も実環境での追認項目とし、まず Phase 3 の帯域 LinkModel で同じQoS性質を
+決定論的に回帰検出できるようにする。
