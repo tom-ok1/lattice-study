@@ -5,7 +5,7 @@
 
 use mb_control::RouteTable;
 use mb_types::{Component, LinkId, MonoTime, NodeId};
-use mb_wire::{ForwardPacket, PacketType, Priority};
+use mb_wire::{ForwardFlags, ForwardPacket, PacketType, Priority};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -62,6 +62,25 @@ struct LinkQueues {
     deficit_bytes: [usize; 3],
     next_drr: usize,
     drr_needs_quantum: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConflationKey {
+    source: NodeId,
+    flow_id: u64,
+    conflate_key: u64,
+}
+
+impl ConflationKey {
+    fn from_packet(packet: &ForwardPacket) -> Option<Self> {
+        (packet.header.priority == Priority::P1
+            && packet.header.flags.contains(ForwardFlags::CONFLATABLE))
+        .then_some(Self {
+            source: packet.header.source,
+            flow_id: packet.header.flow_id,
+            conflate_key: packet.header.conflate_key,
+        })
+    }
 }
 
 impl Default for LinkQueues {
@@ -162,6 +181,22 @@ impl Forwarder {
         let priority = packet.header.priority;
         let queue_index = priority_index(priority);
         let state = self.links.entry(link).or_default();
+
+        if let Some(key) = ConflationKey::from_packet(&packet) {
+            if let Some(queued) = state.queues[queue_index]
+                .iter_mut()
+                .find(|queued| ConflationKey::from_packet(queued) == Some(key))
+            {
+                let previous_len = queued.encoded_len();
+                let replacement_len = packet.encoded_len();
+                *queued = packet;
+                state.queued_bytes[queue_index] = state.queued_bytes[queue_index]
+                    .saturating_sub(previous_len)
+                    .saturating_add(replacement_len);
+                return self.drain_link(link);
+            }
+        }
+
         if state.queues[queue_index].len() >= QUEUE_LIMIT_PACKETS[queue_index] {
             return if priority == Priority::P0 {
                 vec![ForwardAction::Backpressure { link, packet }]
@@ -296,8 +331,9 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use mb_control::Route;
-    use mb_wire::{ForwardFlags, ForwardHeader, Priority};
+    use mb_wire::{ForwardHeader, Priority, FORWARD_HEADER_LEN};
     use std::collections::BTreeMap;
+    use std::mem::size_of;
 
     fn node(value: u8) -> NodeId {
         let mut bytes = [0_u8; 32];
@@ -340,6 +376,22 @@ mod tests {
             },
             payload: Bytes::from_static(b"end-to-end payload"),
         }
+    }
+
+    fn conflatable_packet(
+        source: NodeId,
+        destination: NodeId,
+        flow_id: u64,
+        conflate_key: u64,
+        payload: Bytes,
+    ) -> ForwardPacket {
+        let mut packet = packet(source, destination, 32);
+        packet.header.flags = ForwardFlags::from_bits(ForwardFlags::CONFLATABLE)
+            .expect("conflatable is a supported flag");
+        packet.header.flow_id = flow_id;
+        packet.header.conflate_key = conflate_key;
+        packet.payload = payload;
+        packet
     }
 
     fn one_action(actions: Vec<ForwardAction>) -> ForwardAction {
@@ -595,6 +647,207 @@ mod tests {
         assert_eq!(snapshot.available_credit_bytes, 0);
         assert_eq!(snapshot.packet_counts, [0; 4]);
         assert_eq!(snapshot.queued_bytes, [0; 4]);
+    }
+
+    #[test]
+    fn repeated_conflatable_updates_send_only_the_latest_packet() {
+        fn run() -> (Vec<ForwardAction>, LinkQueueSnapshot, LinkQueueSnapshot) {
+            let [a, b] = [node(1), node(2)];
+            let link = LinkId::new(1);
+            let mut forwarder = Forwarder::new(a, route_table([(b, link, 10, 1)]));
+
+            for sequence in 0_u64..1_000 {
+                let queued = conflatable_packet(
+                    a,
+                    b,
+                    42,
+                    7,
+                    Bytes::copy_from_slice(&sequence.to_be_bytes()),
+                );
+                assert!(forwarder
+                    .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+                    .is_empty());
+            }
+
+            let before = forwarder
+                .queue_snapshot(link)
+                .expect("conflated packet must remain queued");
+            let actions = forwarder.handle(
+                MonoTime::from_millis(1),
+                ForwardEvent::LinkCredit {
+                    link,
+                    bytes: FORWARD_HEADER_LEN + size_of::<u64>(),
+                },
+            );
+            let after = forwarder
+                .queue_snapshot(link)
+                .expect("link queue state must remain observable");
+            (actions, before, after)
+        }
+
+        let first = run();
+        assert_eq!(first, run());
+        let (actions, before, after) = first;
+        assert_eq!(before.packet_counts, [0, 1, 0, 0]);
+        assert_eq!(
+            before.queued_bytes[1],
+            FORWARD_HEADER_LEN + size_of::<u64>()
+        );
+        let sent = expect_send(one_action(actions), LinkId::new(1));
+        assert_eq!(sent.payload.as_ref(), &999_u64.to_be_bytes());
+        assert_eq!(after.packet_counts, [0; 4]);
+        assert_eq!(after.queued_bytes, [0; 4]);
+    }
+
+    #[test]
+    fn conflation_preserves_queue_position_and_tracks_replacement_size() {
+        let [a, b] = [node(1), node(2)];
+        let link = LinkId::new(1);
+        let mut forwarder = Forwarder::new(a, route_table([(b, link, 10, 1)]));
+        let first = conflatable_packet(a, b, 10, 20, Bytes::from_static(b"old"));
+        let mut second = packet(a, b, 32);
+        second.header.flow_id = 99;
+        second.payload = Bytes::from_static(b"second");
+        let large_replacement = conflatable_packet(a, b, 10, 20, Bytes::from(vec![b'n'; 1_000]));
+        let replacement = conflatable_packet(a, b, 10, 20, Bytes::from_static(b"new"));
+
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::Outbound(first))
+            .is_empty());
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::Outbound(second.clone()))
+            .is_empty());
+        assert!(forwarder
+            .handle(
+                MonoTime::ZERO,
+                ForwardEvent::Outbound(large_replacement.clone())
+            )
+            .is_empty());
+
+        let large_snapshot = forwarder
+            .queue_snapshot(link)
+            .expect("packets must remain queued without credit");
+        assert_eq!(large_snapshot.packet_counts, [0, 2, 0, 0]);
+        assert_eq!(
+            large_snapshot.queued_bytes[1],
+            large_replacement.encoded_len() + second.encoded_len()
+        );
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::Outbound(replacement.clone()))
+            .is_empty());
+
+        let small_snapshot = forwarder
+            .queue_snapshot(link)
+            .expect("smaller replacement must remain queued");
+        assert_eq!(small_snapshot.packet_counts, [0, 2, 0, 0]);
+        assert_eq!(
+            small_snapshot.queued_bytes[1],
+            replacement.encoded_len() + second.encoded_len()
+        );
+
+        let actions = forwarder.handle(
+            MonoTime::from_millis(1),
+            ForwardEvent::LinkCredit {
+                link,
+                bytes: replacement.encoded_len() + second.encoded_len(),
+            },
+        );
+        assert_eq!(actions.len(), 2);
+        let sent_payloads = actions
+            .into_iter()
+            .map(|action| expect_send(action, link).payload)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent_payloads,
+            vec![replacement.payload, Bytes::from_static(b"second")]
+        );
+    }
+
+    #[test]
+    fn conflation_requires_p1_flag_and_an_exact_header_key_match() {
+        fn queued_count(first: ForwardPacket, second: ForwardPacket) -> usize {
+            let [a, b] = [node(1), node(2)];
+            let link = LinkId::new(1);
+            let mut forwarder = Forwarder::new(a, route_table([(b, link, 10, 1)]));
+            assert!(forwarder
+                .handle(MonoTime::ZERO, ForwardEvent::Outbound(first))
+                .is_empty());
+            assert!(forwarder
+                .handle(MonoTime::ZERO, ForwardEvent::Outbound(second))
+                .is_empty());
+            forwarder
+                .queue_snapshot(link)
+                .expect("packets must be queued")
+                .packet_counts
+                .into_iter()
+                .sum()
+        }
+
+        let [a, b, other_source] = [node(1), node(2), node(3)];
+        let base = conflatable_packet(a, b, 10, 20, Bytes::from_static(b"first"));
+
+        let mut without_flag = base.clone();
+        without_flag.header.flags = ForwardFlags::empty();
+        assert_eq!(queued_count(without_flag.clone(), without_flag), 2);
+
+        for priority in [Priority::P0, Priority::P2, Priority::P3] {
+            let mut other_priority = base.clone();
+            other_priority.header.priority = priority;
+            assert_eq!(queued_count(other_priority.clone(), other_priority), 2);
+        }
+
+        let mut different_source = base.clone();
+        different_source.header.source = other_source;
+        assert_eq!(queued_count(base.clone(), different_source), 2);
+
+        let mut different_flow = base.clone();
+        different_flow.header.flow_id += 1;
+        assert_eq!(queued_count(base.clone(), different_flow), 2);
+
+        let mut different_key = base.clone();
+        different_key.header.conflate_key += 1;
+        assert_eq!(queued_count(base, different_key), 2);
+    }
+
+    #[test]
+    fn a_full_p1_queue_still_accepts_a_matching_replacement() {
+        let [a, b] = [node(1), node(2)];
+        let link = LinkId::new(1);
+        let mut forwarder = Forwarder::new(a, route_table([(b, link, 10, 1)]));
+
+        for key in 0..QUEUE_LIMIT_PACKETS[1] as u64 {
+            let queued = conflatable_packet(a, b, 42, key, Bytes::from_static(b"old"));
+            assert!(forwarder
+                .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+                .is_empty());
+        }
+
+        let replacement = conflatable_packet(a, b, 42, 0, Bytes::from_static(b"latest"));
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::Outbound(replacement))
+            .is_empty());
+        assert_eq!(
+            forwarder
+                .queue_snapshot(link)
+                .expect("full queue must remain observable")
+                .packet_counts[1],
+            QUEUE_LIMIT_PACKETS[1]
+        );
+
+        let overflow = conflatable_packet(
+            a,
+            b,
+            42,
+            QUEUE_LIMIT_PACKETS[1] as u64,
+            Bytes::from_static(b"new key"),
+        );
+        assert!(matches!(
+            one_action(forwarder.handle(MonoTime::ZERO, ForwardEvent::Outbound(overflow))),
+            ForwardAction::Drop {
+                reason: DropReason::QueueFull(Priority::P1),
+                ..
+            }
+        ));
     }
 
     #[test]

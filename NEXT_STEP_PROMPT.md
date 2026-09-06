@@ -17,9 +17,11 @@
 - TTL exceeded、no route、incoming link への折り返し、未対応 packet type の明示的 drop
 - Link ごとの有限な P0〜P3 queue と incremental byte credit
 - P0 strict priority、P1〜P3 の決定的 DRR、queue overflow の Backpressure / drop
+- P1 かつ `CONFLATABLE` の packet を `(source, flow_id, conflate_key)` で置換する Conflation
+- Conflation 時の queue 位置維持、`queued_bytes` 更新、満杯時の同一 key 置換
 - A-B-C の 2 hop 転送と Action 列の決定性テスト
 
-次の目的は、**Phase 2 の次の縦切りとして P1 queue の Conflation を追加し、帯域待ちの間に同じキーの古い状態を最新 packet へ置き換えられるようにすること**です。
+次の目的は、**Phase 2 の次の縦切りとして Explicit Multicast の fan-out を追加し、同じ next hop を通る複数宛先へ packet を Link ごとに一度だけ送れるようにすること**です。
 
 まずドキュメントと依存関係を確認し、実装前に短く以下を示してください。
 
@@ -30,22 +32,23 @@
 
 有力なスコープは以下です。
 
-- `ForwardFlags::CONFLATABLE` が付いた P1 packet だけを Conflation 対象にする
-- key は payload を読まず `(source, flow_id, conflate_key)` から作る
-- 同じ key が queue 内にあれば、queue 位置を維持したまま最新 packet へ置換する
-- 置換時に `queued_bytes` を新しい packet sizeへ正しく更新する
-- 異なる key、P0/P2/P3、flagなし packetは置換しない
-- 同じ keyを1000回投入しても、credit付与後に最新packetだけが送られることを検証する
-- Conflation後もDRR、queue上限、Action列の決定性が維持されることを検証する
+- `mb-forward` に宛先集合を受け取る明示的な multicast event を追加する
+- 宛先は最大64件に制限し、空集合、重複、上限超過の扱いを明示する
+- `RouteTable` の next hop ごとに宛先を決定的にグループ化する
+- 同じ next hop の宛先には packet を一つだけ生成し、異なる next hop にはそれぞれ一つ生成する
+- 自ノードを含む場合は local delivery し、到達不能な宛先を他の宛先から分離して扱う
+- multicast の宛先リスト codec を境界検証つきで実装する
+- 分岐後も payload の `Bytes` を可能な限り共有する
+- 分岐トポロジで全宛先へ届き、各 Link の送信が一回だけであることと Action 列の決定性を検証する
 
 必須の設計制約は次のとおりです。
 
 - `mb-forward` に `tokio`、socket、ファイル I/O、実時刻取得を入れない
-- packet priority は payload ではなく 88 byte header だけから判断する
-- Conflation key は E2E 暗号化される可能性がある payload から導出しない
-- 新しい packetへの置換でqueue内の順序を変えない
+- 中継ノードに Topic や購読状態を持たせない
+- 宛先リストとアプリケーション payload の境界を明示し、本文を解釈しない
+- 同一入力からの next hop と Action の順序を決定的にする
 - 既存のcredit、P0 strict priority、DRR、queue overflowを壊さない
-- Explicit Multicast、ECMP、Link Down 再キュー、P0 no-route 待機、runtime 接続は今回含めない
+- ECMP、Link Down 再キュー、P0 no-route 待機、Pub/Sub、runtime 接続は今回含めない
 - 既存のユーザー変更を保持する
 
 実装後は少なくとも以下を実行してください。
