@@ -3,20 +3,27 @@
 //! The runtime or simulator supplies route updates and packets as events, then
 //! executes the returned actions. This crate never reads clocks or performs I/O.
 
+use bytes::Bytes;
 use mb_control::RouteTable;
 use mb_types::{Component, LinkId, MonoTime, NodeId};
-use mb_wire::{ForwardFlags, ForwardPacket, PacketType, Priority};
-use std::collections::{BTreeMap, VecDeque};
+use mb_wire::{
+    ForwardFlags, ForwardPacket, MulticastPayload, MulticastPayloadError, PacketType, Priority,
+};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 pub const QUEUE_LIMIT_PACKETS: [usize; 4] = [256, 512, 1_024, 4_096];
 pub const DRR_QUANTUM_BYTES: [usize; 3] = [14 * 1_024, 5 * 1_024, 1_024];
+pub const P0_ROUTE_WAIT_MS: u64 = 2_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DropReason {
     TtlExceeded,
     NoRoute,
     LoopDetected,
+    LinkDown,
+    RouteWaitExpired,
+    InvalidMulticast(MulticastPayloadError),
     UnsupportedPacketType(PacketType),
     QueueFull(Priority),
 }
@@ -24,9 +31,26 @@ pub enum DropReason {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ForwardEvent {
     Outbound(ForwardPacket),
-    Inbound { link: LinkId, packet: ForwardPacket },
+    OutboundMulticast {
+        destinations: Vec<NodeId>,
+        packet: ForwardPacket,
+    },
+    Inbound {
+        link: LinkId,
+        packet: ForwardPacket,
+    },
     RoutesUpdated(Arc<RouteTable>),
-    LinkCredit { link: LinkId, bytes: usize },
+    LinkCredit {
+        link: LinkId,
+        bytes: usize,
+    },
+    LinkDown(LinkId),
+    Timer(ForwardTimer),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ForwardTimer {
+    PendingP0 { generation: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +59,8 @@ pub enum ForwardAction {
         link: LinkId,
         packet: ForwardPacket,
     },
+    /// For multicast, the routing destination prefix has been removed and the
+    /// payload contains only the opaque application body.
     DeliverLocal(ForwardPacket),
     Drop {
         reason: DropReason,
@@ -43,6 +69,10 @@ pub enum ForwardAction {
     Backpressure {
         link: LinkId,
         packet: ForwardPacket,
+    },
+    SetTimer {
+        timer: ForwardTimer,
+        at: MonoTime,
     },
 }
 
@@ -56,12 +86,24 @@ pub struct LinkQueueSnapshot {
 }
 
 struct LinkQueues {
-    queues: [VecDeque<ForwardPacket>; 4],
+    queues: [VecDeque<QueuedPacket>; 4],
     queued_bytes: [usize; 4],
     available_credit_bytes: usize,
     deficit_bytes: [usize; 3],
     next_drr: usize,
     drr_needs_quantum: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QueuedPacket {
+    incoming: Option<LinkId>,
+    packet: ForwardPacket,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingP0Batch {
+    expires_at: MonoTime,
+    packets: VecDeque<QueuedPacket>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +142,9 @@ pub struct Forwarder {
     me: NodeId,
     routes: Arc<RouteTable>,
     links: BTreeMap<LinkId, LinkQueues>,
+    down_links: BTreeSet<LinkId>,
+    pending_p0: BTreeMap<u64, PendingP0Batch>,
+    next_pending_generation: u64,
 }
 
 impl Forwarder {
@@ -108,6 +153,9 @@ impl Forwarder {
             me,
             routes,
             links: BTreeMap::new(),
+            down_links: BTreeSet::new(),
+            pending_p0: BTreeMap::new(),
+            next_pending_generation: 0,
         }
     }
 
@@ -117,6 +165,13 @@ impl Forwarder {
 
     pub fn route_table(&self) -> Arc<RouteTable> {
         Arc::clone(&self.routes)
+    }
+
+    pub fn pending_p0_len(&self) -> usize {
+        self.pending_p0
+            .values()
+            .map(|batch| batch.packets.len())
+            .sum()
     }
 
     pub fn queue_snapshot(&self, link: LinkId) -> Option<LinkQueueSnapshot> {
@@ -129,19 +184,11 @@ impl Forwarder {
         })
     }
 
-    fn forward(&self, incoming: Option<LinkId>, mut packet: ForwardPacket) -> ForwardAction {
-        if packet.header.ttl == 0 {
-            return ForwardAction::Drop {
-                reason: DropReason::TtlExceeded,
-                packet,
-            };
-        }
-        if packet.header.packet_type != PacketType::Unicast {
-            return ForwardAction::Drop {
-                reason: DropReason::UnsupportedPacketType(packet.header.packet_type),
-                packet,
-            };
-        }
+    fn forward_unicast(
+        &self,
+        incoming: Option<LinkId>,
+        mut packet: ForwardPacket,
+    ) -> ForwardAction {
         if packet.header.destination == self.me {
             return ForwardAction::DeliverLocal(packet);
         }
@@ -152,6 +199,12 @@ impl Forwarder {
                 packet,
             };
         };
+        if self.down_links.contains(&route.next_hop) {
+            return ForwardAction::Drop {
+                reason: DropReason::NoRoute,
+                packet,
+            };
+        }
         if incoming == Some(route.next_hop) {
             return ForwardAction::Drop {
                 reason: DropReason::LoopDetected,
@@ -166,18 +219,135 @@ impl Forwarder {
         }
     }
 
+    fn process_outbound_multicast(
+        &mut self,
+        destinations: Vec<NodeId>,
+        mut packet: ForwardPacket,
+    ) -> Vec<ForwardAction> {
+        packet.header.packet_type = PacketType::Multicast;
+        packet.header.destination = NodeId::default();
+        let multicast = match MulticastPayload::new(destinations, packet.payload.clone()) {
+            Ok(multicast) => multicast,
+            Err(error) => {
+                return vec![ForwardAction::Drop {
+                    reason: DropReason::InvalidMulticast(error),
+                    packet,
+                }];
+            }
+        };
+        (packet.multicast_destinations, packet.payload) = multicast.into_parts();
+        self.process_packet(None, packet)
+    }
+
     fn process_packet(
         &mut self,
         incoming: Option<LinkId>,
         packet: ForwardPacket,
     ) -> Vec<ForwardAction> {
-        match self.forward(incoming, packet) {
-            ForwardAction::Send { link, packet } => self.enqueue(link, packet),
-            action => vec![action],
+        if packet.header.ttl == 0 {
+            return vec![ForwardAction::Drop {
+                reason: DropReason::TtlExceeded,
+                packet,
+            }];
+        }
+
+        match packet.header.packet_type {
+            PacketType::Unicast => match self.forward_unicast(incoming, packet) {
+                ForwardAction::Send { link, packet } => self.enqueue(link, packet, incoming),
+                action => vec![action],
+            },
+            PacketType::Multicast => self.forward_multicast(incoming, packet),
+            unsupported => vec![ForwardAction::Drop {
+                reason: DropReason::UnsupportedPacketType(unsupported),
+                packet,
+            }],
         }
     }
 
-    fn enqueue(&mut self, link: LinkId, packet: ForwardPacket) -> Vec<ForwardAction> {
+    fn forward_multicast(
+        &mut self,
+        incoming: Option<LinkId>,
+        packet: ForwardPacket,
+    ) -> Vec<ForwardAction> {
+        let multicast = match MulticastPayload::new(
+            packet.multicast_destinations.clone(),
+            packet.payload.clone(),
+        ) {
+            Ok(multicast) => multicast,
+            Err(error) => {
+                return vec![ForwardAction::Drop {
+                    reason: DropReason::InvalidMulticast(error),
+                    packet,
+                }];
+            }
+        };
+        let (destinations, body) = multicast.into_parts();
+        let mut deliver_local = false;
+        let mut no_route = Vec::new();
+        let mut looped = Vec::new();
+        let mut by_link: BTreeMap<LinkId, Vec<NodeId>> = BTreeMap::new();
+
+        for destination in destinations {
+            if destination == self.me {
+                deliver_local = true;
+                continue;
+            }
+            let Some(route) = self.routes.get(&destination) else {
+                no_route.push(destination);
+                continue;
+            };
+            if self.down_links.contains(&route.next_hop) {
+                no_route.push(destination);
+                continue;
+            }
+            if incoming == Some(route.next_hop) {
+                looped.push(destination);
+                continue;
+            }
+            by_link.entry(route.next_hop).or_default().push(destination);
+        }
+
+        let mut actions = Vec::new();
+        if deliver_local {
+            let mut local = packet.clone();
+            local.header.destination = self.me;
+            local.multicast_destinations.clear();
+            local.payload = body.clone();
+            actions.push(ForwardAction::DeliverLocal(local));
+        }
+        if !no_route.is_empty() {
+            actions.push(ForwardAction::Drop {
+                reason: DropReason::NoRoute,
+                packet: multicast_subset_packet(&packet, no_route, body.clone(), packet.header.ttl),
+            });
+        }
+        if !looped.is_empty() {
+            actions.push(ForwardAction::Drop {
+                reason: DropReason::LoopDetected,
+                packet: multicast_subset_packet(&packet, looped, body.clone(), packet.header.ttl),
+            });
+        }
+
+        let next_ttl = packet.header.ttl - 1;
+        for (link, destinations) in by_link {
+            let branch = multicast_subset_packet(&packet, destinations, body.clone(), next_ttl);
+            actions.extend(self.enqueue(link, branch, incoming));
+        }
+        actions
+    }
+
+    fn enqueue(
+        &mut self,
+        link: LinkId,
+        packet: ForwardPacket,
+        incoming: Option<LinkId>,
+    ) -> Vec<ForwardAction> {
+        if self.down_links.contains(&link) {
+            return vec![ForwardAction::Drop {
+                reason: DropReason::LinkDown,
+                packet,
+            }];
+        }
         let priority = packet.header.priority;
         let queue_index = priority_index(priority);
         let state = self.links.entry(link).or_default();
@@ -185,11 +355,11 @@ impl Forwarder {
         if let Some(key) = ConflationKey::from_packet(&packet) {
             if let Some(queued) = state.queues[queue_index]
                 .iter_mut()
-                .find(|queued| ConflationKey::from_packet(queued) == Some(key))
+                .find(|queued| ConflationKey::from_packet(&queued.packet) == Some(key))
             {
-                let previous_len = queued.encoded_len();
+                let previous_len = queued.packet.encoded_len();
                 let replacement_len = packet.encoded_len();
-                *queued = packet;
+                *queued = QueuedPacket { incoming, packet };
                 state.queued_bytes[queue_index] = state.queued_bytes[queue_index]
                     .saturating_sub(previous_len)
                     .saturating_add(replacement_len);
@@ -210,11 +380,14 @@ impl Forwarder {
 
         state.queued_bytes[queue_index] =
             state.queued_bytes[queue_index].saturating_add(packet.encoded_len());
-        state.queues[queue_index].push_back(packet);
+        state.queues[queue_index].push_back(QueuedPacket { incoming, packet });
         self.drain_link(link)
     }
 
     fn grant_credit(&mut self, link: LinkId, bytes: usize) -> Vec<ForwardAction> {
+        if self.down_links.contains(&link) {
+            return Vec::new();
+        }
         let state = self.links.entry(link).or_default();
         state.available_credit_bytes = state.available_credit_bytes.saturating_add(bytes);
         self.drain_link(link)
@@ -227,23 +400,29 @@ impl Forwarder {
         let mut actions = Vec::new();
 
         loop {
-            if let Some(packet_len) = state.queues[0].front().map(ForwardPacket::encoded_len) {
+            if let Some(packet_len) = state.queues[0]
+                .front()
+                .map(|queued| queued.packet.encoded_len())
+            {
                 if packet_len > state.available_credit_bytes {
                     break;
                 }
-                let packet = state.queues[0]
+                let queued = state.queues[0]
                     .pop_front()
                     .expect("P0 queue front was checked");
                 state.queued_bytes[0] = state.queued_bytes[0].saturating_sub(packet_len);
                 state.available_credit_bytes -= packet_len;
-                actions.push(ForwardAction::Send { link, packet });
+                actions.push(ForwardAction::Send {
+                    link,
+                    packet: queued.packet,
+                });
                 continue;
             }
 
             let a_packet_fits_credit = state.queues[1..].iter().any(|queue| {
-                queue
-                    .front()
-                    .is_some_and(|packet| packet.encoded_len() <= state.available_credit_bytes)
+                queue.front().is_some_and(|queued| {
+                    queued.packet.encoded_len() <= state.available_credit_bytes
+                })
             });
             if !a_packet_fits_credit {
                 break;
@@ -265,6 +444,7 @@ impl Forwarder {
             let packet_len = state.queues[queue_index]
                 .front()
                 .expect("non-empty DRR queue was checked")
+                .packet
                 .encoded_len();
             if packet_len > state.deficit_bytes[drr_index]
                 || packet_len > state.available_credit_bytes
@@ -273,14 +453,17 @@ impl Forwarder {
                 continue;
             }
 
-            let packet = state.queues[queue_index]
+            let queued = state.queues[queue_index]
                 .pop_front()
                 .expect("DRR queue front was checked");
             state.deficit_bytes[drr_index] -= packet_len;
             state.queued_bytes[queue_index] =
                 state.queued_bytes[queue_index].saturating_sub(packet_len);
             state.available_credit_bytes -= packet_len;
-            actions.push(ForwardAction::Send { link, packet });
+            actions.push(ForwardAction::Send {
+                link,
+                packet: queued.packet,
+            });
             if state.queues[queue_index].is_empty() {
                 state.deficit_bytes[drr_index] = 0;
                 advance_drr(state);
@@ -289,6 +472,248 @@ impl Forwarder {
 
         actions
     }
+
+    fn handle_link_down(&mut self, now: MonoTime, link: LinkId) -> Vec<ForwardAction> {
+        self.down_links.insert(link);
+        let Some(state) = self.links.remove(&link) else {
+            return Vec::new();
+        };
+        let [p0, p1, p2, p3] = state.queues;
+        let mut actions = Vec::new();
+
+        if !p0.is_empty() {
+            let generation = self.next_pending_generation();
+            let expires_at =
+                MonoTime::from_millis(now.as_millis().saturating_add(P0_ROUTE_WAIT_MS));
+            self.pending_p0.insert(
+                generation,
+                PendingP0Batch {
+                    expires_at,
+                    packets: p0,
+                },
+            );
+            actions.push(ForwardAction::SetTimer {
+                timer: ForwardTimer::PendingP0 { generation },
+                at: expires_at,
+            });
+        }
+
+        actions.extend(drop_queued_packets(p1, DropReason::LinkDown));
+        for queued in p2 {
+            let (mut routed, unresolved) = self.reroute_queued(queued);
+            actions.append(&mut routed);
+            actions.extend(unresolved.into_iter().map(|queued| ForwardAction::Drop {
+                reason: DropReason::LinkDown,
+                packet: queued.packet,
+            }));
+        }
+        actions.extend(drop_queued_packets(p3, DropReason::LinkDown));
+        actions
+    }
+
+    fn next_pending_generation(&mut self) -> u64 {
+        loop {
+            let generation = self.next_pending_generation;
+            self.next_pending_generation = self.next_pending_generation.wrapping_add(1);
+            if !self.pending_p0.contains_key(&generation) {
+                return generation;
+            }
+        }
+    }
+
+    fn handle_routes_updated(
+        &mut self,
+        now: MonoTime,
+        routes: Arc<RouteTable>,
+    ) -> Vec<ForwardAction> {
+        self.routes = routes;
+        let referenced_links = self
+            .routes
+            .iter()
+            .map(|(_, route)| route.next_hop)
+            .collect::<BTreeSet<_>>();
+        self.down_links
+            .retain(|link| referenced_links.contains(link));
+        self.retry_pending_p0(now)
+    }
+
+    fn retry_pending_p0(&mut self, now: MonoTime) -> Vec<ForwardAction> {
+        let batches = std::mem::take(&mut self.pending_p0);
+        let mut actions = Vec::new();
+
+        for (generation, batch) in batches {
+            if now >= batch.expires_at {
+                actions.extend(drop_queued_packets(
+                    batch.packets,
+                    DropReason::RouteWaitExpired,
+                ));
+                continue;
+            }
+
+            let mut remaining = VecDeque::new();
+            for queued in batch.packets {
+                let (mut routed, unresolved) = self.reroute_queued(queued);
+                actions.append(&mut routed);
+                remaining.extend(unresolved);
+            }
+            if !remaining.is_empty() {
+                self.pending_p0.insert(
+                    generation,
+                    PendingP0Batch {
+                        expires_at: batch.expires_at,
+                        packets: remaining,
+                    },
+                );
+            }
+        }
+        actions
+    }
+
+    fn handle_timer(&mut self, now: MonoTime, timer: ForwardTimer) -> Vec<ForwardAction> {
+        match timer {
+            ForwardTimer::PendingP0 { generation } => {
+                let Some(batch) = self.pending_p0.remove(&generation) else {
+                    return Vec::new();
+                };
+                if now < batch.expires_at {
+                    let expires_at = batch.expires_at;
+                    self.pending_p0.insert(generation, batch);
+                    return vec![ForwardAction::SetTimer {
+                        timer,
+                        at: expires_at,
+                    }];
+                }
+                drop_queued_packets(batch.packets, DropReason::RouteWaitExpired)
+            }
+        }
+    }
+
+    fn reroute_queued(&mut self, queued: QueuedPacket) -> (Vec<ForwardAction>, Vec<QueuedPacket>) {
+        match queued.packet.header.packet_type {
+            PacketType::Unicast => self.reroute_unicast(queued),
+            PacketType::Multicast => self.reroute_multicast(queued),
+            unsupported => (
+                vec![ForwardAction::Drop {
+                    reason: DropReason::UnsupportedPacketType(unsupported),
+                    packet: queued.packet,
+                }],
+                Vec::new(),
+            ),
+        }
+    }
+
+    fn reroute_unicast(&mut self, queued: QueuedPacket) -> (Vec<ForwardAction>, Vec<QueuedPacket>) {
+        if queued.packet.header.destination == self.me {
+            return (vec![ForwardAction::DeliverLocal(queued.packet)], Vec::new());
+        }
+        let Some(link) = self.reroute_link(queued.packet.header.destination, queued.incoming)
+        else {
+            return (Vec::new(), vec![queued]);
+        };
+        (
+            self.enqueue(link, queued.packet, queued.incoming),
+            Vec::new(),
+        )
+    }
+
+    fn reroute_multicast(
+        &mut self,
+        queued: QueuedPacket,
+    ) -> (Vec<ForwardAction>, Vec<QueuedPacket>) {
+        let multicast = match MulticastPayload::new(
+            queued.packet.multicast_destinations.clone(),
+            queued.packet.payload.clone(),
+        ) {
+            Ok(multicast) => multicast,
+            Err(error) => {
+                return (
+                    vec![ForwardAction::Drop {
+                        reason: DropReason::InvalidMulticast(error),
+                        packet: queued.packet,
+                    }],
+                    Vec::new(),
+                );
+            }
+        };
+        let (destinations, body) = multicast.into_parts();
+        let mut deliver_local = false;
+        let mut unresolved = Vec::new();
+        let mut by_link: BTreeMap<LinkId, Vec<NodeId>> = BTreeMap::new();
+
+        for destination in destinations {
+            if destination == self.me {
+                deliver_local = true;
+            } else if let Some(link) = self.reroute_link(destination, queued.incoming) {
+                by_link.entry(link).or_default().push(destination);
+            } else {
+                unresolved.push(destination);
+            }
+        }
+
+        let mut actions = Vec::new();
+        if deliver_local {
+            let mut local = queued.packet.clone();
+            local.header.destination = self.me;
+            local.multicast_destinations.clear();
+            local.payload = body.clone();
+            actions.push(ForwardAction::DeliverLocal(local));
+        }
+        for (link, destinations) in by_link {
+            let packet = multicast_subset_packet(
+                &queued.packet,
+                destinations,
+                body.clone(),
+                queued.packet.header.ttl,
+            );
+            actions.extend(self.enqueue(link, packet, queued.incoming));
+        }
+
+        let unresolved = if unresolved.is_empty() {
+            Vec::new()
+        } else {
+            vec![QueuedPacket {
+                incoming: queued.incoming,
+                packet: multicast_subset_packet(
+                    &queued.packet,
+                    unresolved,
+                    body,
+                    queued.packet.header.ttl,
+                ),
+            }]
+        };
+        (actions, unresolved)
+    }
+
+    fn reroute_link(&self, destination: NodeId, incoming: Option<LinkId>) -> Option<LinkId> {
+        let link = self.routes.get(&destination)?.next_hop;
+        (!self.down_links.contains(&link) && incoming != Some(link)).then_some(link)
+    }
+}
+
+fn drop_queued_packets(packets: VecDeque<QueuedPacket>, reason: DropReason) -> Vec<ForwardAction> {
+    packets
+        .into_iter()
+        .map(|queued| ForwardAction::Drop {
+            reason,
+            packet: queued.packet,
+        })
+        .collect()
+}
+
+fn multicast_subset_packet(
+    template: &ForwardPacket,
+    destinations: Vec<NodeId>,
+    body: Bytes,
+    ttl: u8,
+) -> ForwardPacket {
+    let multicast = MulticastPayload::new(destinations, body)
+        .expect("a non-empty subset of a validated multicast payload remains valid");
+    let mut packet = template.clone();
+    packet.header.packet_type = PacketType::Multicast;
+    packet.header.destination = NodeId::default();
+    packet.header.ttl = ttl;
+    (packet.multicast_destinations, packet.payload) = multicast.into_parts();
+    packet
 }
 
 fn priority_index(priority: Priority) -> usize {
@@ -313,15 +738,18 @@ impl Component for Forwarder {
     type Event = ForwardEvent;
     type Action = ForwardAction;
 
-    fn handle(&mut self, _now: MonoTime, event: Self::Event) -> Vec<Self::Action> {
+    fn handle(&mut self, now: MonoTime, event: Self::Event) -> Vec<Self::Action> {
         match event {
             ForwardEvent::Outbound(packet) => self.process_packet(None, packet),
+            ForwardEvent::OutboundMulticast {
+                destinations,
+                packet,
+            } => self.process_outbound_multicast(destinations, packet),
             ForwardEvent::Inbound { link, packet } => self.process_packet(Some(link), packet),
-            ForwardEvent::RoutesUpdated(routes) => {
-                self.routes = routes;
-                Vec::new()
-            }
+            ForwardEvent::RoutesUpdated(routes) => self.handle_routes_updated(now, routes),
             ForwardEvent::LinkCredit { link, bytes } => self.grant_credit(link, bytes),
+            ForwardEvent::LinkDown(link) => self.handle_link_down(now, link),
+            ForwardEvent::Timer(timer) => self.handle_timer(now, timer),
         }
     }
 }
@@ -344,8 +772,15 @@ mod tests {
     fn route_table(
         entries: impl IntoIterator<Item = (NodeId, LinkId, u32, u8)>,
     ) -> Arc<RouteTable> {
+        route_table_version(1, entries)
+    }
+
+    fn route_table_version(
+        version: u64,
+        entries: impl IntoIterator<Item = (NodeId, LinkId, u32, u8)>,
+    ) -> Arc<RouteTable> {
         Arc::new(RouteTable::new(
-            1,
+            version,
             entries
                 .into_iter()
                 .map(|(destination, next_hop, cost, hops)| {
@@ -374,6 +809,7 @@ mod tests {
                 flow_id: 42,
                 conflate_key: 0,
             },
+            multicast_destinations: Vec::new(),
             payload: Bytes::from_static(b"end-to-end payload"),
         }
     }
@@ -392,6 +828,47 @@ mod tests {
         packet.header.conflate_key = conflate_key;
         packet.payload = payload;
         packet
+    }
+
+    fn multicast_template(source: NodeId, ttl: u8, body: Bytes) -> ForwardPacket {
+        let mut packet = packet(source, NodeId::default(), ttl);
+        packet.payload = body;
+        packet
+    }
+
+    fn encoded_multicast_packet(
+        source: NodeId,
+        ttl: u8,
+        destinations: Vec<NodeId>,
+        body: Bytes,
+    ) -> ForwardPacket {
+        let mut packet = multicast_template(source, ttl, Bytes::new());
+        packet.header.packet_type = PacketType::Multicast;
+        let multicast =
+            MulticastPayload::new(destinations, body).expect("valid multicast test payload");
+        (packet.multicast_destinations, packet.payload) = multicast.into_parts();
+        packet
+    }
+
+    fn decode_multicast(packet: &ForwardPacket) -> MulticastPayload {
+        assert_eq!(packet.header.packet_type, PacketType::Multicast);
+        MulticastPayload::new(
+            packet.multicast_destinations.clone(),
+            packet.payload.clone(),
+        )
+        .expect("forwarded multicast payload must be valid")
+    }
+
+    fn grant_unlimited_credit(forwarder: &mut Forwarder, link: LinkId) {
+        assert!(forwarder
+            .handle(
+                MonoTime::ZERO,
+                ForwardEvent::LinkCredit {
+                    link,
+                    bytes: usize::MAX,
+                },
+            )
+            .is_empty());
     }
 
     fn one_action(actions: Vec<ForwardAction>) -> ForwardAction {
@@ -483,6 +960,675 @@ mod tests {
     }
 
     #[test]
+    fn multicast_fans_out_once_per_link_and_delivers_every_destination() {
+        let [source, branch, a, b, c] = [node(1), node(2), node(3), node(4), node(5)];
+        let [source_to_branch, source_to_c, branch_from_source, branch_to_a, branch_to_b] = [
+            LinkId::new(1),
+            LinkId::new(2),
+            LinkId::new(3),
+            LinkId::new(4),
+            LinkId::new(5),
+        ];
+        let mut at_source = Forwarder::new(
+            source,
+            route_table([
+                (branch, source_to_branch, 10, 1),
+                (a, source_to_branch, 20, 2),
+                (b, source_to_branch, 20, 2),
+                (c, source_to_c, 10, 1),
+            ]),
+        );
+        let mut at_branch = Forwarder::new(
+            branch,
+            route_table([(a, branch_to_a, 10, 1), (b, branch_to_b, 10, 1)]),
+        );
+        let mut at_a = Forwarder::new(a, Arc::new(RouteTable::default()));
+        let mut at_b = Forwarder::new(b, Arc::new(RouteTable::default()));
+        let mut at_c = Forwarder::new(c, Arc::new(RouteTable::default()));
+        let body = Bytes::from_static(b"one body for every subscriber");
+
+        grant_unlimited_credit(&mut at_source, source_to_branch);
+        grant_unlimited_credit(&mut at_source, source_to_c);
+        grant_unlimited_credit(&mut at_branch, branch_to_a);
+        grant_unlimited_credit(&mut at_branch, branch_to_b);
+
+        let source_actions = at_source.handle(
+            MonoTime::ZERO,
+            ForwardEvent::OutboundMulticast {
+                destinations: vec![c, b, branch, a],
+                packet: multicast_template(source, 32, body.clone()),
+            },
+        );
+        assert_eq!(source_actions.len(), 2);
+        let to_branch = expect_send(source_actions[0].clone(), source_to_branch);
+        let to_c = expect_send(source_actions[1].clone(), source_to_c);
+        assert_eq!(to_branch.header.ttl, 31);
+        assert_eq!(decode_multicast(&to_branch).destinations(), &[branch, a, b]);
+        assert_eq!(decode_multicast(&to_c).destinations(), &[c]);
+        assert_eq!(to_branch.payload.as_ptr(), body.as_ptr());
+        assert_eq!(to_c.payload.as_ptr(), body.as_ptr());
+
+        let branch_actions = at_branch.handle(
+            MonoTime::from_millis(1),
+            ForwardEvent::Inbound {
+                link: branch_from_source,
+                packet: to_branch,
+            },
+        );
+        assert_eq!(branch_actions.len(), 3);
+        match &branch_actions[0] {
+            ForwardAction::DeliverLocal(packet) => {
+                assert_eq!(packet.header.destination, branch);
+                assert_eq!(packet.payload, body);
+            }
+            other => panic!("expected branch-local delivery, got {other:?}"),
+        }
+        let to_a = expect_send(branch_actions[1].clone(), branch_to_a);
+        let to_b = expect_send(branch_actions[2].clone(), branch_to_b);
+        assert_eq!(decode_multicast(&to_a).destinations(), &[a]);
+        assert_eq!(decode_multicast(&to_b).destinations(), &[b]);
+        assert_eq!(to_a.payload.as_ptr(), body.as_ptr());
+        assert_eq!(to_b.payload.as_ptr(), body.as_ptr());
+
+        for (forwarder, incoming, packet, destination) in [
+            (&mut at_a, LinkId::new(6), to_a, a),
+            (&mut at_b, LinkId::new(7), to_b, b),
+            (&mut at_c, LinkId::new(8), to_c, c),
+        ] {
+            match one_action(forwarder.handle(
+                MonoTime::from_millis(2),
+                ForwardEvent::Inbound {
+                    link: incoming,
+                    packet,
+                },
+            )) {
+                ForwardAction::DeliverLocal(packet) => {
+                    assert_eq!(packet.header.destination, destination);
+                    assert_eq!(packet.payload, body);
+                }
+                other => panic!("expected leaf-local delivery, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn multicast_isolates_local_no_route_loop_and_forwarded_destinations() {
+        let [source, me, looped, forwarded, unreachable] =
+            [node(1), node(2), node(3), node(4), node(5)];
+        let [incoming, outgoing] = [LinkId::new(10), LinkId::new(20)];
+        let mut forwarder = Forwarder::new(
+            me,
+            route_table([(looped, incoming, 10, 1), (forwarded, outgoing, 10, 1)]),
+        );
+        assert!(forwarder
+            .handle(
+                MonoTime::ZERO,
+                ForwardEvent::LinkCredit {
+                    link: outgoing,
+                    bytes: usize::MAX,
+                },
+            )
+            .is_empty());
+        let body = Bytes::from_static(b"isolated body");
+        let inbound = encoded_multicast_packet(
+            source,
+            8,
+            vec![forwarded, unreachable, me, looped],
+            body.clone(),
+        );
+
+        let actions = forwarder.handle(
+            MonoTime::ZERO,
+            ForwardEvent::Inbound {
+                link: incoming,
+                packet: inbound,
+            },
+        );
+
+        assert_eq!(actions.len(), 4);
+        assert!(matches!(
+            &actions[0],
+            ForwardAction::DeliverLocal(packet) if packet.payload == body
+        ));
+        match &actions[1] {
+            ForwardAction::Drop {
+                reason: DropReason::NoRoute,
+                packet,
+            } => assert_eq!(decode_multicast(packet).destinations(), &[unreachable]),
+            other => panic!("expected isolated no-route drop, got {other:?}"),
+        }
+        match &actions[2] {
+            ForwardAction::Drop {
+                reason: DropReason::LoopDetected,
+                packet,
+            } => assert_eq!(decode_multicast(packet).destinations(), &[looped]),
+            other => panic!("expected isolated loop drop, got {other:?}"),
+        }
+        let sent = expect_send(actions[3].clone(), outgoing);
+        assert_eq!(sent.header.ttl, 7);
+        assert_eq!(decode_multicast(&sent).destinations(), &[forwarded]);
+    }
+
+    #[test]
+    fn multicast_destination_order_does_not_change_actions() {
+        fn run(destinations: Vec<NodeId>) -> Vec<ForwardAction> {
+            let [source, a, b, c] = [node(1), node(2), node(3), node(4)];
+            let [first, second] = [LinkId::new(1), LinkId::new(2)];
+            let mut forwarder = Forwarder::new(
+                source,
+                route_table([(a, first, 10, 1), (b, first, 10, 1), (c, second, 10, 1)]),
+            );
+            for link in [first, second] {
+                assert!(forwarder
+                    .handle(
+                        MonoTime::ZERO,
+                        ForwardEvent::LinkCredit {
+                            link,
+                            bytes: usize::MAX,
+                        },
+                    )
+                    .is_empty());
+            }
+            forwarder.handle(
+                MonoTime::ZERO,
+                ForwardEvent::OutboundMulticast {
+                    destinations,
+                    packet: multicast_template(source, 32, Bytes::from_static(b"deterministic")),
+                },
+            )
+        }
+
+        assert_eq!(
+            run(vec![node(4), node(2), node(3)]),
+            run(vec![node(3), node(4), node(2)])
+        );
+    }
+
+    #[test]
+    fn invalid_outbound_multicast_sets_are_dropped_explicitly() {
+        let source = node(1);
+        let mut forwarder = Forwarder::new(source, Arc::new(RouteTable::default()));
+        let invalid_sets = [
+            (Vec::new(), MulticastPayloadError::EmptyDestinations),
+            (
+                vec![node(2), node(2)],
+                MulticastPayloadError::DuplicateDestination(node(2)),
+            ),
+            (
+                (0..=mb_wire::MAX_MULTICAST_DESTINATIONS)
+                    .map(|value| node(value as u8))
+                    .collect(),
+                MulticastPayloadError::TooManyDestinations(65),
+            ),
+        ];
+
+        for (destinations, expected) in invalid_sets {
+            assert!(matches!(
+                one_action(forwarder.handle(
+                    MonoTime::ZERO,
+                    ForwardEvent::OutboundMulticast {
+                        destinations,
+                        packet: multicast_template(source, 32, Bytes::new()),
+                    },
+                )),
+                ForwardAction::Drop {
+                    reason: DropReason::InvalidMulticast(error),
+                    ..
+                } if error == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn link_down_removes_link_state_and_applies_priority_policies() {
+        let [me, destination] = [node(1), node(2)];
+        let failed = LinkId::new(10);
+        let mut forwarder = Forwarder::new(me, route_table([(destination, failed, 10, 1)]));
+
+        for (flow_id, priority) in [
+            (0, Priority::P0),
+            (1, Priority::P1),
+            (2, Priority::P2),
+            (3, Priority::P3),
+        ] {
+            let mut queued = packet(me, destination, 32);
+            queued.header.flow_id = flow_id;
+            queued.header.priority = priority;
+            assert!(forwarder
+                .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+                .is_empty());
+        }
+
+        let actions = forwarder.handle(MonoTime::from_millis(10), ForwardEvent::LinkDown(failed));
+
+        assert_eq!(actions.len(), 4);
+        assert_eq!(
+            actions[0],
+            ForwardAction::SetTimer {
+                timer: ForwardTimer::PendingP0 { generation: 0 },
+                at: MonoTime::from_millis(2_010),
+            }
+        );
+        for (action, priority) in
+            actions[1..]
+                .iter()
+                .zip([Priority::P1, Priority::P2, Priority::P3])
+        {
+            assert!(matches!(
+                action,
+                ForwardAction::Drop {
+                    reason: DropReason::LinkDown,
+                    packet,
+                } if packet.header.priority == priority
+            ));
+        }
+        assert_eq!(forwarder.pending_p0_len(), 1);
+        assert_eq!(forwarder.queue_snapshot(failed), None);
+        assert!(forwarder
+            .handle(
+                MonoTime::from_millis(11),
+                ForwardEvent::LinkCredit {
+                    link: failed,
+                    bytes: usize::MAX,
+                },
+            )
+            .is_empty());
+        assert!(forwarder
+            .handle(MonoTime::from_millis(11), ForwardEvent::LinkDown(failed),)
+            .is_empty());
+
+        let mut after_down = packet(me, destination, 32);
+        after_down.header.priority = Priority::P2;
+        assert!(matches!(
+            one_action(forwarder.handle(
+                MonoTime::from_millis(12),
+                ForwardEvent::Outbound(after_down),
+            )),
+            ForwardAction::Drop {
+                reason: DropReason::NoRoute,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn link_down_reroutes_p2_without_decrementing_ttl_twice() {
+        let [me, destination] = [node(1), node(2)];
+        let [failed, alternate] = [LinkId::new(10), LinkId::new(20)];
+        let mut forwarder = Forwarder::new(me, route_table([(destination, failed, 10, 1)]));
+        let mut queued = packet(me, destination, 32);
+        queued.header.priority = Priority::P2;
+
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+            .is_empty());
+        assert!(forwarder
+            .handle(
+                MonoTime::from_millis(1),
+                ForwardEvent::RoutesUpdated(route_table_version(
+                    2,
+                    [(destination, alternate, 20, 2)],
+                )),
+            )
+            .is_empty());
+        grant_unlimited_credit(&mut forwarder, alternate);
+
+        let sent = expect_send(
+            one_action(forwarder.handle(MonoTime::from_millis(2), ForwardEvent::LinkDown(failed))),
+            alternate,
+        );
+
+        assert_eq!(sent.header.priority, Priority::P2);
+        assert_eq!(sent.header.ttl, 31);
+        assert_eq!(forwarder.queue_snapshot(failed), None);
+    }
+
+    #[test]
+    fn pending_p0_uses_new_route_and_ignores_its_stale_timer() {
+        let [me, destination] = [node(1), node(2)];
+        let [failed, alternate] = [LinkId::new(10), LinkId::new(20)];
+        let mut forwarder = Forwarder::new(me, route_table([(destination, failed, 10, 1)]));
+        let mut queued = packet(me, destination, 32);
+        queued.header.priority = Priority::P0;
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+            .is_empty());
+
+        let timer = ForwardTimer::PendingP0 { generation: 0 };
+        assert_eq!(
+            one_action(
+                forwarder.handle(MonoTime::from_millis(100), ForwardEvent::LinkDown(failed),)
+            ),
+            ForwardAction::SetTimer {
+                timer,
+                at: MonoTime::from_millis(2_100),
+            }
+        );
+        assert_eq!(forwarder.pending_p0_len(), 1);
+        assert_eq!(
+            one_action(forwarder.handle(MonoTime::from_millis(1_000), ForwardEvent::Timer(timer),)),
+            ForwardAction::SetTimer {
+                timer,
+                at: MonoTime::from_millis(2_100),
+            }
+        );
+        grant_unlimited_credit(&mut forwarder, alternate);
+
+        let sent = expect_send(
+            one_action(forwarder.handle(
+                MonoTime::from_millis(1_500),
+                ForwardEvent::RoutesUpdated(route_table_version(
+                    2,
+                    [(destination, alternate, 20, 2)],
+                )),
+            )),
+            alternate,
+        );
+        assert_eq!(sent.header.ttl, 31);
+        assert_eq!(sent.header.priority, Priority::P0);
+        assert_eq!(forwarder.pending_p0_len(), 0);
+        assert!(forwarder
+            .handle(MonoTime::from_millis(2_100), ForwardEvent::Timer(timer),)
+            .is_empty());
+    }
+
+    #[test]
+    fn pending_p0_expires_after_two_seconds_in_fifo_order() {
+        let [me, destination] = [node(1), node(2)];
+        let failed = LinkId::new(10);
+        let mut forwarder = Forwarder::new(me, route_table([(destination, failed, 10, 1)]));
+        for flow_id in [10, 20] {
+            let mut queued = packet(me, destination, 32);
+            queued.header.priority = Priority::P0;
+            queued.header.flow_id = flow_id;
+            assert!(forwarder
+                .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+                .is_empty());
+        }
+        let timer = ForwardTimer::PendingP0 { generation: 0 };
+        assert_eq!(
+            one_action(forwarder.handle(MonoTime::ZERO, ForwardEvent::LinkDown(failed))),
+            ForwardAction::SetTimer {
+                timer,
+                at: MonoTime::from_millis(P0_ROUTE_WAIT_MS),
+            }
+        );
+        assert_eq!(
+            one_action(forwarder.handle(
+                MonoTime::from_millis(P0_ROUTE_WAIT_MS - 1),
+                ForwardEvent::Timer(timer),
+            )),
+            ForwardAction::SetTimer {
+                timer,
+                at: MonoTime::from_millis(P0_ROUTE_WAIT_MS),
+            }
+        );
+
+        let expired = forwarder.handle(
+            MonoTime::from_millis(P0_ROUTE_WAIT_MS),
+            ForwardEvent::Timer(timer),
+        );
+
+        assert_eq!(expired.len(), 2);
+        assert_eq!(
+            expired
+                .iter()
+                .map(|action| match action {
+                    ForwardAction::Drop {
+                        reason: DropReason::RouteWaitExpired,
+                        packet,
+                    } => packet.header.flow_id,
+                    other => panic!("expected expired P0 drop, got {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        assert_eq!(forwarder.pending_p0_len(), 0);
+    }
+
+    #[test]
+    fn pending_multicast_p0_partially_recovers_and_expires_the_unresolved_subset() {
+        let [me, a, b, unresolved] = [node(1), node(2), node(3), node(4)];
+        let [failed, alternate] = [LinkId::new(10), LinkId::new(20)];
+        let mut forwarder = Forwarder::new(
+            me,
+            route_table([
+                (a, failed, 10, 1),
+                (b, failed, 10, 1),
+                (unresolved, failed, 10, 1),
+            ]),
+        );
+        let body = Bytes::from_static(b"pending multicast body");
+        let mut outbound = multicast_template(me, 32, body.clone());
+        outbound.header.priority = Priority::P0;
+        assert!(forwarder
+            .handle(
+                MonoTime::ZERO,
+                ForwardEvent::OutboundMulticast {
+                    destinations: vec![unresolved, b, a],
+                    packet: outbound,
+                },
+            )
+            .is_empty());
+        let timer = ForwardTimer::PendingP0 { generation: 0 };
+        assert_eq!(
+            one_action(forwarder.handle(MonoTime::ZERO, ForwardEvent::LinkDown(failed))),
+            ForwardAction::SetTimer {
+                timer,
+                at: MonoTime::from_millis(P0_ROUTE_WAIT_MS),
+            }
+        );
+        grant_unlimited_credit(&mut forwarder, alternate);
+
+        let recovered = expect_send(
+            one_action(forwarder.handle(
+                MonoTime::from_millis(1_000),
+                ForwardEvent::RoutesUpdated(route_table_version(
+                    2,
+                    [(a, alternate, 20, 2), (b, alternate, 20, 2)],
+                )),
+            )),
+            alternate,
+        );
+        assert_eq!(decode_multicast(&recovered).destinations(), &[a, b]);
+        assert_eq!(recovered.header.ttl, 31);
+        assert_eq!(recovered.payload.as_ptr(), body.as_ptr());
+        assert_eq!(forwarder.pending_p0_len(), 1);
+
+        match one_action(forwarder.handle(
+            MonoTime::from_millis(P0_ROUTE_WAIT_MS),
+            ForwardEvent::Timer(timer),
+        )) {
+            ForwardAction::Drop {
+                reason: DropReason::RouteWaitExpired,
+                packet,
+            } => {
+                assert_eq!(decode_multicast(&packet).destinations(), &[unresolved]);
+                assert_eq!(packet.payload.as_ptr(), body.as_ptr());
+            }
+            other => panic!("expected unresolved multicast expiry, got {other:?}"),
+        }
+        assert_eq!(forwarder.pending_p0_len(), 0);
+    }
+
+    #[test]
+    fn link_down_regroups_multicast_p2_by_alternate_next_hop() {
+        let [me, a, b, c, unreachable] = [node(1), node(2), node(3), node(4), node(5)];
+        let [failed, first, second] = [LinkId::new(10), LinkId::new(20), LinkId::new(30)];
+        let initial_routes = route_table([
+            (a, failed, 10, 1),
+            (b, failed, 10, 1),
+            (c, failed, 10, 1),
+            (unreachable, failed, 10, 1),
+        ]);
+        let mut forwarder = Forwarder::new(me, initial_routes);
+        let body = Bytes::from_static(b"shared rerouted multicast body");
+        let mut outbound = multicast_template(me, 32, body.clone());
+        outbound.header.priority = Priority::P2;
+        assert!(forwarder
+            .handle(
+                MonoTime::ZERO,
+                ForwardEvent::OutboundMulticast {
+                    destinations: vec![unreachable, c, b, a],
+                    packet: outbound,
+                },
+            )
+            .is_empty());
+        assert!(forwarder
+            .handle(
+                MonoTime::from_millis(1),
+                ForwardEvent::RoutesUpdated(route_table_version(
+                    2,
+                    [(a, first, 20, 2), (b, first, 20, 2), (c, second, 20, 2),],
+                )),
+            )
+            .is_empty());
+        grant_unlimited_credit(&mut forwarder, first);
+        grant_unlimited_credit(&mut forwarder, second);
+
+        let actions = forwarder.handle(MonoTime::from_millis(2), ForwardEvent::LinkDown(failed));
+
+        assert_eq!(actions.len(), 3);
+        let to_first = expect_send(actions[0].clone(), first);
+        let to_second = expect_send(actions[1].clone(), second);
+        assert_eq!(decode_multicast(&to_first).destinations(), &[a, b]);
+        assert_eq!(decode_multicast(&to_second).destinations(), &[c]);
+        assert_eq!(to_first.header.ttl, 31);
+        assert_eq!(to_second.header.ttl, 31);
+        assert_eq!(to_first.payload.as_ptr(), body.as_ptr());
+        assert_eq!(to_second.payload.as_ptr(), body.as_ptr());
+        match &actions[2] {
+            ForwardAction::Drop {
+                reason: DropReason::LinkDown,
+                packet,
+            } => assert_eq!(decode_multicast(packet).destinations(), &[unreachable]),
+            other => panic!("expected unreachable multicast branch drop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_down_reroute_uses_existing_queue_overflow_policy() {
+        let [me, destination] = [node(1), node(2)];
+        let [failed, alternate] = [LinkId::new(10), LinkId::new(20)];
+        let mut forwarder = Forwarder::new(me, route_table([(destination, failed, 10, 1)]));
+        let mut on_failed = packet(me, destination, 32);
+        on_failed.header.priority = Priority::P2;
+        on_failed.header.flow_id = u64::MAX;
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::Outbound(on_failed))
+            .is_empty());
+        assert!(forwarder
+            .handle(
+                MonoTime::from_millis(1),
+                ForwardEvent::RoutesUpdated(route_table_version(
+                    2,
+                    [(destination, alternate, 20, 2)],
+                )),
+            )
+            .is_empty());
+        for flow_id in 0..QUEUE_LIMIT_PACKETS[Priority::P2 as usize] as u64 {
+            let mut queued = packet(me, destination, 32);
+            queued.header.priority = Priority::P2;
+            queued.header.flow_id = flow_id;
+            assert!(forwarder
+                .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+                .is_empty());
+        }
+
+        assert!(matches!(
+            one_action(forwarder.handle(
+                MonoTime::from_millis(2),
+                ForwardEvent::LinkDown(failed),
+            )),
+            ForwardAction::Drop {
+                reason: DropReason::QueueFull(Priority::P2),
+                packet,
+            } if packet.header.flow_id == u64::MAX
+        ));
+        assert_eq!(
+            forwarder
+                .queue_snapshot(alternate)
+                .expect("alternate queue must remain full")
+                .packet_counts[Priority::P2 as usize],
+            QUEUE_LIMIT_PACKETS[Priority::P2 as usize]
+        );
+    }
+
+    #[test]
+    fn link_down_reroute_never_reflects_a_packet_to_its_incoming_link() {
+        let [source, me, destination] = [node(1), node(2), node(3)];
+        let [incoming, failed] = [LinkId::new(10), LinkId::new(20)];
+        let mut forwarder = Forwarder::new(me, route_table([(destination, failed, 10, 1)]));
+        let mut inbound = packet(source, destination, 32);
+        inbound.header.priority = Priority::P2;
+        assert!(forwarder
+            .handle(
+                MonoTime::ZERO,
+                ForwardEvent::Inbound {
+                    link: incoming,
+                    packet: inbound,
+                },
+            )
+            .is_empty());
+        assert!(forwarder
+            .handle(
+                MonoTime::from_millis(1),
+                ForwardEvent::RoutesUpdated(route_table_version(
+                    2,
+                    [(destination, incoming, 20, 2)],
+                )),
+            )
+            .is_empty());
+
+        assert!(matches!(
+            one_action(forwarder.handle(
+                MonoTime::from_millis(2),
+                ForwardEvent::LinkDown(failed),
+            )),
+            ForwardAction::Drop {
+                reason: DropReason::LinkDown,
+                packet,
+            } if packet.header.ttl == 31
+        ));
+        assert_eq!(forwarder.queue_snapshot(incoming), None);
+    }
+
+    #[test]
+    fn link_down_processing_is_deterministic() {
+        fn run() -> (Vec<ForwardAction>, usize, Option<LinkQueueSnapshot>) {
+            let [me, destination] = [node(1), node(2)];
+            let [failed, alternate] = [LinkId::new(10), LinkId::new(20)];
+            let mut forwarder = Forwarder::new(me, route_table([(destination, failed, 10, 1)]));
+            for priority in [Priority::P0, Priority::P1, Priority::P2, Priority::P3] {
+                let mut queued = packet(me, destination, 32);
+                queued.header.priority = priority;
+                assert!(forwarder
+                    .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+                    .is_empty());
+            }
+            assert!(forwarder
+                .handle(
+                    MonoTime::from_millis(1),
+                    ForwardEvent::RoutesUpdated(route_table_version(
+                        2,
+                        [(destination, alternate, 20, 2)],
+                    )),
+                )
+                .is_empty());
+            grant_unlimited_credit(&mut forwarder, alternate);
+            let actions =
+                forwarder.handle(MonoTime::from_millis(2), ForwardEvent::LinkDown(failed));
+            (
+                actions,
+                forwarder.pending_p0_len(),
+                forwarder.queue_snapshot(alternate),
+            )
+        }
+
+        assert_eq!(run(), run());
+    }
+
+    #[test]
     fn invalid_forwarding_conditions_have_explicit_drop_reasons() {
         let [a, b, c] = [node(1), node(2), node(3)];
         let link = LinkId::new(1);
@@ -527,15 +1673,15 @@ mod tests {
             }
         );
 
-        let mut multicast = packet(a, c, 32);
-        multicast.header.packet_type = PacketType::Multicast;
+        let mut unsupported = packet(a, c, 32);
+        unsupported.header.packet_type = PacketType::CircuitData;
         assert_eq!(
             one_action(
-                forwarder.handle(MonoTime::ZERO, ForwardEvent::Outbound(multicast.clone()),)
+                forwarder.handle(MonoTime::ZERO, ForwardEvent::Outbound(unsupported.clone()),)
             ),
             ForwardAction::Drop {
-                reason: DropReason::UnsupportedPacketType(PacketType::Multicast),
-                packet: multicast,
+                reason: DropReason::UnsupportedPacketType(PacketType::CircuitData),
+                packet: unsupported,
             }
         );
     }

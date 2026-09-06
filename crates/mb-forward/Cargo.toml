@@ -6,12 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes.workspace = true
 mb-control = { path = "../mb-control" }
 mb-types = { path = "../mb-types" }
 mb-wire = { path = "../mb-wire" }
-
-[dev-dependencies]
-bytes.workspace = true
 
 [lints]
 workspace = true

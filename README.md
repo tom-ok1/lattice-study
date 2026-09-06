@@ -59,7 +59,7 @@ Anduril Lattice の DSB (Distributed Service Bus) / Lattice Mesh を公開情報
 - `mb-control`: TTL 付き adjacency LSA、LSDB、フラッディング、Anti-Entropy、失効・再発行、双方向アサーション、SPF hold timer、Dijkstra
 - イベント時刻と投入順で駆動する決定論的な 5 ノード用テストハーネス
 - `mb-wire`: LSA/Digest protobuf、固定 8 byte Link header、固定 88 byte Forward header、1 MiB 上限、incremental decoder
-- `mb-forward`: `RouteTable` による I/O なしのユニキャスト転送、TTL、no-route、ループ検知、有限 priority queue、byte credit、P0 strict priority + P1〜P3 DRR、P1 Conflation
+- `mb-forward`: `RouteTable` による I/O なしのユニキャスト転送、Explicit Multicast fan-out、Link Down 時の priority 別キュー処理と P0 の 2 秒経路待機、TTL、no-route、ループ検知、有限 priority queue、byte credit、P0 strict priority + P1〜P3 DRR、P1 Conflation
 - `mb-transport`: TLS なし・静的ピア限定の TCP adapter
 - `mb-runtime`: TCP と control の Event/Action、単調時刻 Timer、再起動をまたぐ seq 永続化を接続する Tokio glue
 - 仮想時刻による 5 ノードの経路収束・分断・短経路への再収束と、loopback TCP 上の動的な 3 ノード参加・経路収束テスト

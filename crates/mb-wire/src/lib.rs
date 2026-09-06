@@ -19,6 +19,158 @@ pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 pub const FORWARD_PACKET_VERSION: u8 = 1;
 pub const FORWARD_HEADER_LEN: usize = 88;
 pub const MAX_FORWARD_PAYLOAD_LEN: usize = MAX_PAYLOAD_LEN - FORWARD_HEADER_LEN;
+pub const MAX_MULTICAST_DESTINATIONS: usize = 64;
+pub const MULTICAST_COUNT_LEN: usize = 2;
+pub const NODE_ID_LEN: usize = 32;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MulticastPayload {
+    destinations: Vec<NodeId>,
+    body: Bytes,
+}
+
+impl MulticastPayload {
+    pub fn new(destinations: Vec<NodeId>, body: Bytes) -> Result<Self, MulticastPayloadError> {
+        let destinations = canonicalize_destinations(destinations)?;
+        let encoded_len = multicast_prefix_len(destinations.len()).saturating_add(body.len());
+        if encoded_len > MAX_FORWARD_PAYLOAD_LEN {
+            return Err(MulticastPayloadError::PayloadTooLarge(encoded_len));
+        }
+        Ok(Self { destinations, body })
+    }
+
+    pub fn destinations(&self) -> &[NodeId] {
+        &self.destinations
+    }
+
+    pub fn body(&self) -> &Bytes {
+        &self.body
+    }
+
+    pub fn into_parts(self) -> (Vec<NodeId>, Bytes) {
+        (self.destinations, self.body)
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        multicast_prefix_len(self.destinations.len()).saturating_add(self.body.len())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MulticastPayloadError {
+    HeaderTooShort(usize),
+    EmptyDestinations,
+    TooManyDestinations(usize),
+    DuplicateDestination(NodeId),
+    DestinationListTruncated { expected: usize, actual: usize },
+    PayloadTooLarge(usize),
+}
+
+impl fmt::Display for MulticastPayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HeaderTooShort(length) => write!(
+                f,
+                "multicast payload is {length} bytes, shorter than the {MULTICAST_COUNT_LEN} byte count"
+            ),
+            Self::EmptyDestinations => write!(f, "multicast destination list is empty"),
+            Self::TooManyDestinations(count) => write!(
+                f,
+                "multicast destination count {count} exceeds the {MAX_MULTICAST_DESTINATIONS} destination limit"
+            ),
+            Self::DuplicateDestination(destination) => {
+                write!(f, "multicast destination {destination} is duplicated")
+            }
+            Self::DestinationListTruncated { expected, actual } => write!(
+                f,
+                "multicast destination list needs {expected} bytes but only {actual} are available"
+            ),
+            Self::PayloadTooLarge(length) => write!(
+                f,
+                "multicast payload length {length} exceeds the {MAX_FORWARD_PAYLOAD_LEN} byte limit"
+            ),
+        }
+    }
+}
+
+impl Error for MulticastPayloadError {}
+
+pub struct MulticastPayloadCodec;
+
+impl MulticastPayloadCodec {
+    pub fn encode(payload: &MulticastPayload) -> Bytes {
+        let mut encoded = BytesMut::with_capacity(payload.encoded_len());
+        encoded.put_u16(payload.destinations.len() as u16);
+        for destination in &payload.destinations {
+            encoded.extend_from_slice(destination.as_bytes());
+        }
+        encoded.extend_from_slice(&payload.body);
+        encoded.freeze()
+    }
+
+    pub fn decode(encoded: Bytes) -> Result<MulticastPayload, MulticastPayloadError> {
+        if encoded.len() > MAX_FORWARD_PAYLOAD_LEN {
+            return Err(MulticastPayloadError::PayloadTooLarge(encoded.len()));
+        }
+        if encoded.len() < MULTICAST_COUNT_LEN {
+            return Err(MulticastPayloadError::HeaderTooShort(encoded.len()));
+        }
+
+        let count = u16::from_be_bytes([encoded[0], encoded[1]]) as usize;
+        if count == 0 {
+            return Err(MulticastPayloadError::EmptyDestinations);
+        }
+        if count > MAX_MULTICAST_DESTINATIONS {
+            return Err(MulticastPayloadError::TooManyDestinations(count));
+        }
+
+        let prefix_len = multicast_prefix_len(count);
+        if encoded.len() < prefix_len {
+            return Err(MulticastPayloadError::DestinationListTruncated {
+                expected: prefix_len,
+                actual: encoded.len(),
+            });
+        }
+
+        let mut destinations = Vec::with_capacity(count);
+        for index in 0..count {
+            let start = MULTICAST_COUNT_LEN + index * NODE_ID_LEN;
+            let mut bytes = [0_u8; NODE_ID_LEN];
+            bytes.copy_from_slice(&encoded[start..start + NODE_ID_LEN]);
+            destinations.push(NodeId::from_bytes(bytes));
+        }
+        let destinations = canonicalize_destinations(destinations)?;
+        let body = encoded.slice(prefix_len..);
+        MulticastPayload::new(destinations, body)
+    }
+}
+
+fn canonicalize_destinations(
+    mut destinations: Vec<NodeId>,
+) -> Result<Vec<NodeId>, MulticastPayloadError> {
+    if destinations.is_empty() {
+        return Err(MulticastPayloadError::EmptyDestinations);
+    }
+    if destinations.len() > MAX_MULTICAST_DESTINATIONS {
+        return Err(MulticastPayloadError::TooManyDestinations(
+            destinations.len(),
+        ));
+    }
+
+    destinations.sort_unstable();
+    if let Some(duplicate) = destinations
+        .windows(2)
+        .find(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0])
+    {
+        return Err(MulticastPayloadError::DuplicateDestination(duplicate));
+    }
+    Ok(destinations)
+}
+
+fn multicast_prefix_len(destination_count: usize) -> usize {
+    MULTICAST_COUNT_LEN.saturating_add(destination_count.saturating_mul(NODE_ID_LEN))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -111,12 +263,22 @@ pub struct ForwardHeader {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForwardPacket {
     pub header: ForwardHeader,
+    /// Populated only for multicast packets. The wire codec places these
+    /// destinations before `payload`, while the in-memory body stays shareable.
+    pub multicast_destinations: Vec<NodeId>,
     pub payload: Bytes,
 }
 
 impl ForwardPacket {
     pub fn encoded_len(&self) -> usize {
-        FORWARD_HEADER_LEN.saturating_add(self.payload.len())
+        let multicast_prefix = if self.header.packet_type == PacketType::Multicast {
+            multicast_prefix_len(self.multicast_destinations.len())
+        } else {
+            0
+        };
+        FORWARD_HEADER_LEN
+            .saturating_add(multicast_prefix)
+            .saturating_add(self.payload.len())
     }
 }
 
@@ -127,6 +289,8 @@ pub enum ForwardPacketError {
     UnknownPacketType(u8),
     UnknownPriority(u8),
     UnsupportedFlags(u32),
+    InvalidMulticast(MulticastPayloadError),
+    UnexpectedMulticastDestinations(usize),
     PayloadTooLarge(usize),
 }
 
@@ -149,6 +313,11 @@ impl fmt::Display for ForwardPacketError {
             Self::UnsupportedFlags(flags) => {
                 write!(f, "unsupported forward packet flags {flags:#010x}")
             }
+            Self::InvalidMulticast(error) => write!(f, "invalid multicast payload: {error}"),
+            Self::UnexpectedMulticastDestinations(count) => write!(
+                f,
+                "non-multicast forward packet contains {count} multicast destinations"
+            ),
             Self::PayloadTooLarge(length) => write!(
                 f,
                 "forward packet payload length {length} exceeds the {MAX_FORWARD_PAYLOAD_LEN} byte limit"
@@ -163,11 +332,26 @@ pub struct ForwardPacketCodec;
 
 impl ForwardPacketCodec {
     pub fn encode(packet: &ForwardPacket) -> Result<Bytes, ForwardPacketError> {
-        if packet.payload.len() > MAX_FORWARD_PAYLOAD_LEN {
-            return Err(ForwardPacketError::PayloadTooLarge(packet.payload.len()));
+        let wire_payload = if packet.header.packet_type == PacketType::Multicast {
+            let multicast = MulticastPayload::new(
+                packet.multicast_destinations.clone(),
+                packet.payload.clone(),
+            )
+            .map_err(ForwardPacketError::InvalidMulticast)?;
+            MulticastPayloadCodec::encode(&multicast)
+        } else {
+            if !packet.multicast_destinations.is_empty() {
+                return Err(ForwardPacketError::UnexpectedMulticastDestinations(
+                    packet.multicast_destinations.len(),
+                ));
+            }
+            packet.payload.clone()
+        };
+        if wire_payload.len() > MAX_FORWARD_PAYLOAD_LEN {
+            return Err(ForwardPacketError::PayloadTooLarge(wire_payload.len()));
         }
 
-        let mut encoded = BytesMut::with_capacity(FORWARD_HEADER_LEN + packet.payload.len());
+        let mut encoded = BytesMut::with_capacity(FORWARD_HEADER_LEN + wire_payload.len());
         encoded.put_u8(FORWARD_PACKET_VERSION);
         encoded.put_u8(packet.header.packet_type as u8);
         encoded.put_u8(packet.header.priority as u8);
@@ -177,7 +361,7 @@ impl ForwardPacketCodec {
         encoded.extend_from_slice(packet.header.source.as_bytes());
         encoded.put_u64(packet.header.flow_id);
         encoded.put_u64(packet.header.conflate_key);
-        encoded.extend_from_slice(&packet.payload);
+        encoded.extend_from_slice(&wire_payload);
         Ok(encoded.freeze())
     }
 
@@ -214,6 +398,15 @@ impl ForwardPacketCodec {
                 .expect("conflate_key slice has a fixed length"),
         );
 
+        let wire_payload = encoded.slice(FORWARD_HEADER_LEN..);
+        let (multicast_destinations, payload) = if packet_type == PacketType::Multicast {
+            MulticastPayloadCodec::decode(wire_payload)
+                .map_err(ForwardPacketError::InvalidMulticast)?
+                .into_parts()
+        } else {
+            (Vec::new(), wire_payload)
+        };
+
         Ok(ForwardPacket {
             header: ForwardHeader {
                 packet_type,
@@ -225,7 +418,8 @@ impl ForwardPacketCodec {
                 flow_id,
                 conflate_key,
             },
-            payload: encoded.slice(FORWARD_HEADER_LEN..),
+            multicast_destinations,
+            payload,
         })
     }
 }
@@ -424,6 +618,7 @@ mod tests {
                 flow_id: 0x0102_0304_0506_0708,
                 conflate_key: 0x1112_1314_1516_1718,
             },
+            multicast_destinations: Vec::new(),
             payload: Bytes::from_static(b"opaque payload"),
         }
     }
@@ -528,6 +723,129 @@ mod tests {
     }
 
     #[test]
+    fn multicast_forward_packet_keeps_destinations_separate_from_shared_body() {
+        let mut original = forward_packet();
+        original.header.packet_type = PacketType::Multicast;
+        original.header.destination = NodeId::default();
+        original.multicast_destinations = vec![node(2), node(3)];
+
+        let encoded = ForwardPacketCodec::encode(&original).expect("packet must encode");
+        let encoded_start = encoded.as_ptr();
+        assert_eq!(
+            &encoded[FORWARD_HEADER_LEN..FORWARD_HEADER_LEN + MULTICAST_COUNT_LEN],
+            &(2_u16.to_be_bytes())
+        );
+        let decoded = ForwardPacketCodec::decode(encoded).expect("packet must decode");
+
+        assert_eq!(decoded, original);
+        assert_eq!(
+            decoded.payload.as_ptr(),
+            encoded_start.wrapping_add(
+                FORWARD_HEADER_LEN + multicast_prefix_len(original.multicast_destinations.len())
+            )
+        );
+    }
+
+    #[test]
+    fn multicast_payload_round_trips_canonically_and_slices_the_body() {
+        let body = Bytes::from_static(b"opaque application payload");
+        let original = MulticastPayload::new(vec![node(3), node(1), node(2)], body.clone())
+            .expect("valid multicast payload");
+
+        let encoded = MulticastPayloadCodec::encode(&original);
+        let encoded_start = encoded.as_ptr();
+        let decoded = MulticastPayloadCodec::decode(encoded).expect("payload must decode");
+
+        assert_eq!(decoded.destinations(), &[node(1), node(2), node(3)]);
+        assert_eq!(decoded.body(), &body);
+        assert_eq!(
+            decoded.body().as_ptr(),
+            encoded_start.wrapping_add(multicast_prefix_len(3))
+        );
+    }
+
+    #[test]
+    fn multicast_payload_accepts_the_sixty_four_destination_boundary() {
+        let destinations = (0..MAX_MULTICAST_DESTINATIONS)
+            .map(|value| node(value as u8))
+            .collect::<Vec<_>>();
+        let original = MulticastPayload::new(destinations, Bytes::new())
+            .expect("64 destinations are supported");
+
+        let decoded = MulticastPayloadCodec::decode(MulticastPayloadCodec::encode(&original))
+            .expect("boundary payload must decode");
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn invalid_multicast_destination_lists_are_rejected() {
+        assert_eq!(
+            MulticastPayload::new(Vec::new(), Bytes::new()),
+            Err(MulticastPayloadError::EmptyDestinations)
+        );
+
+        let too_many = (0..=MAX_MULTICAST_DESTINATIONS)
+            .map(|value| node(value as u8))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            MulticastPayload::new(too_many, Bytes::new()),
+            Err(MulticastPayloadError::TooManyDestinations(65))
+        );
+        assert_eq!(
+            MulticastPayload::new(vec![node(1), node(1)], Bytes::new()),
+            Err(MulticastPayloadError::DuplicateDestination(node(1)))
+        );
+
+        assert_eq!(
+            MulticastPayloadCodec::decode(Bytes::from_static(&[0])),
+            Err(MulticastPayloadError::HeaderTooShort(1))
+        );
+        assert_eq!(
+            MulticastPayloadCodec::decode(Bytes::from_static(&[0, 0])),
+            Err(MulticastPayloadError::EmptyDestinations)
+        );
+
+        let mut truncated = BytesMut::new();
+        truncated.put_u16(2);
+        truncated.extend_from_slice(node(1).as_bytes());
+        assert_eq!(
+            MulticastPayloadCodec::decode(truncated.freeze()),
+            Err(MulticastPayloadError::DestinationListTruncated {
+                expected: MULTICAST_COUNT_LEN + 2 * NODE_ID_LEN,
+                actual: MULTICAST_COUNT_LEN + NODE_ID_LEN,
+            })
+        );
+
+        let mut duplicate = BytesMut::new();
+        duplicate.put_u16(2);
+        duplicate.extend_from_slice(node(1).as_bytes());
+        duplicate.extend_from_slice(node(1).as_bytes());
+        assert_eq!(
+            MulticastPayloadCodec::decode(duplicate.freeze()),
+            Err(MulticastPayloadError::DuplicateDestination(node(1)))
+        );
+    }
+
+    #[test]
+    fn multicast_prefix_is_included_in_the_forward_payload_limit() {
+        let oversized_body = Bytes::from(vec![0_u8; MAX_FORWARD_PAYLOAD_LEN]);
+        assert_eq!(
+            MulticastPayload::new(vec![node(1)], oversized_body),
+            Err(MulticastPayloadError::PayloadTooLarge(
+                MAX_FORWARD_PAYLOAD_LEN + MULTICAST_COUNT_LEN + NODE_ID_LEN
+            ))
+        );
+        let oversized_encoded = Bytes::from(vec![0_u8; MAX_FORWARD_PAYLOAD_LEN + 1]);
+        assert_eq!(
+            MulticastPayloadCodec::decode(oversized_encoded),
+            Err(MulticastPayloadError::PayloadTooLarge(
+                MAX_FORWARD_PAYLOAD_LEN + 1
+            ))
+        );
+    }
+
+    #[test]
     fn invalid_forward_packet_headers_are_rejected() {
         assert_eq!(
             ForwardPacketCodec::decode(Bytes::from_static(&[0; FORWARD_HEADER_LEN - 1])),
@@ -554,6 +872,24 @@ mod tests {
         assert_eq!(
             ForwardPacketCodec::decode(unsupported_flags.freeze()),
             Err(ForwardPacketError::UnsupportedFlags(1 << 3))
+        );
+
+        let mut unicast_with_destinations = forward_packet();
+        unicast_with_destinations
+            .multicast_destinations
+            .push(node(3));
+        assert_eq!(
+            ForwardPacketCodec::encode(&unicast_with_destinations),
+            Err(ForwardPacketError::UnexpectedMulticastDestinations(1))
+        );
+
+        let mut multicast_without_destinations = forward_packet();
+        multicast_without_destinations.header.packet_type = PacketType::Multicast;
+        assert_eq!(
+            ForwardPacketCodec::encode(&multicast_without_destinations),
+            Err(ForwardPacketError::InvalidMulticast(
+                MulticastPayloadError::EmptyDestinations
+            ))
         );
     }
 

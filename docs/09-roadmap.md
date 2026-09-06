@@ -47,8 +47,8 @@ A-D の直接リンクを追加 → A→E が 2 hop に変わる
 - [x] `mb-forward`：88 バイトヘッダ、転送ループ、TTL、ループ検知
 - [x] 優先度キュー（P0 厳密 + P1〜P3 DRR）
 - [x] Conflation
-- [ ] Explicit Multicast の fan-out
-- [ ] Link Down 時のキュー処理
+- [x] Explicit Multicast の fan-out
+- [x] Link Down 時のキュー処理
 - [ ] ECMP と flow_id ハッシュ
 - [ ] `mbtool trace`（経路トレース、キュー待ち時間つき）
 - [ ] メトリクス：`mb_queue_depth_*`, `mb_queue_wait_seconds`, `mb_fwd_dropped_total`
