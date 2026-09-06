@@ -23,7 +23,7 @@
 - [x] `mb-control`：LSA 構造、LSDB、フラッディング、重複排除
 - [x] 双方向アサーションによるグラフ構築
 - [x] Dijkstra + 経路表
-- [ ] SPF hold timer
+- [x] SPF hold timer
 - [x] Anti-entropy digest 交換
 - [x] LSA の失効（MaxAge）と再発行、seq 永続化
 - [ ] `mbtool routes` / `mbtool lsdb` / `mbtool path`

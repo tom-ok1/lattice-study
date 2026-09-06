@@ -1,7 +1,8 @@
 use mb_control::{
     Adjacency, ControlAction, ControlEvent, ControlFrame, ControlPlane, ControlTimer, LinkCost,
     Lsa, LsaMessage, DEFAULT_LSA_TTL_SEC, DIGEST_INTERVAL_MS, MAX_DIGEST_ENTRIES,
-    MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSDB_ENTRIES,
+    MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSDB_ENTRIES, SPF_INITIAL_HOLD_MS,
+    SPF_MAX_HOLD_MS, SPF_QUIET_RESET_MS,
 };
 use mb_types::{Component, LinkId, MonoTime, NodeId};
 use std::collections::{BTreeMap, VecDeque};
@@ -17,11 +18,43 @@ fn cost(value: u16) -> LinkCost {
     LinkCost::new(value).expect("test cost must be non-zero")
 }
 
+fn scheduled_spf(actions: &[ControlAction]) -> (ControlTimer, MonoTime) {
+    actions
+        .iter()
+        .find_map(|action| match action {
+            ControlAction::SetTimer {
+                timer: timer @ ControlTimer::SpfHold { .. },
+                at,
+            } => Some((*timer, *at)),
+            _ => None,
+        })
+        .expect("an SPF timer must be scheduled")
+}
+
+fn reciprocal_lsa(origin: NodeId, peer: NodeId, seq: u64) -> LsaMessage {
+    LsaMessage {
+        lsa: Lsa {
+            origin,
+            epoch: 1,
+            seq,
+            ttl_sec: DEFAULT_LSA_TTL_SEC,
+            adjacencies: vec![Adjacency {
+                peer,
+                cost: cost(10),
+            }],
+        },
+        canonical_bytes: Arc::from([]),
+        signature: Arc::from([]),
+    }
+}
+
 struct Harness {
     nodes: Vec<ControlPlane>,
     endpoints: BTreeMap<(usize, LinkId), (usize, LinkId)>,
     queue: VecDeque<(usize, ControlEvent)>,
+    spf_timers: BTreeMap<(u64, u64), (usize, ControlTimer)>,
     next_link: u64,
+    next_timer: u64,
     now_ms: u64,
     event_log: Vec<String>,
 }
@@ -36,7 +69,9 @@ impl Harness {
                 .collect(),
             endpoints: BTreeMap::new(),
             queue: VecDeque::new(),
+            spf_timers: BTreeMap::new(),
             next_link: 1,
+            next_timer: 0,
             now_ms: 0,
             event_log: Vec::new(),
         }
@@ -104,26 +139,51 @@ impl Harness {
         mut should_deliver: impl FnMut(usize, &ControlEvent) -> bool,
     ) {
         let mut processed = 0_usize;
-        while let Some((target, event)) = self.queue.pop_front() {
+        loop {
+            let scheduled = if let Some((target, event)) = self.queue.pop_front() {
+                Some((self.now_ms.saturating_add(1), target, event))
+            } else {
+                self.spf_timers
+                    .pop_first()
+                    .map(|((at, _), (target, timer))| (at, target, ControlEvent::Timer(timer)))
+            };
+            let Some((at, target, event)) = scheduled else {
+                break;
+            };
             processed += 1;
             assert!(processed < 10_000, "control plane did not quiesce");
             if !should_deliver(target, &event) {
                 continue;
             }
-            self.now_ms += 1;
+            self.now_ms = self.now_ms.saturating_add(1).max(at);
             self.event_log.push(format!("{target}:{event:?}"));
             let actions = self.nodes[target].handle(MonoTime::from_millis(self.now_ms), event);
             for action in actions {
-                if let ControlAction::Send { link, frame } = action {
-                    if let Some((peer, peer_link)) = self.endpoints.get(&(target, link)).copied() {
-                        self.queue.push_back((
-                            peer,
-                            ControlEvent::Frame {
-                                link: peer_link,
-                                frame,
-                            },
-                        ));
+                match action {
+                    ControlAction::Send { link, frame } => {
+                        if let Some((peer, peer_link)) =
+                            self.endpoints.get(&(target, link)).copied()
+                        {
+                            self.queue.push_back((
+                                peer,
+                                ControlEvent::Frame {
+                                    link: peer_link,
+                                    frame,
+                                },
+                            ));
+                        }
                     }
+                    ControlAction::SetTimer {
+                        timer: timer @ ControlTimer::SpfHold { .. },
+                        at,
+                    } => {
+                        self.spf_timers
+                            .insert((at.as_millis(), self.next_timer), (target, timer));
+                        self.next_timer = self.next_timer.wrapping_add(1);
+                    }
+                    ControlAction::SetTimer { .. }
+                    | ControlAction::PublishRoutes(_)
+                    | ControlAction::PersistSeq(_) => {}
                 }
             }
         }
@@ -302,6 +362,151 @@ fn digest_timer_sends_a_summary_and_reschedules_itself() {
 }
 
 #[test]
+fn spf_hold_waits_for_deadline_and_coalesces_a_burst() {
+    let me = node(1);
+    let peer = node(2);
+    let link = LinkId::new(1);
+    let mut plane = ControlPlane::new_unsecured(me, 1);
+
+    let initial = plane.handle(
+        MonoTime::ZERO,
+        ControlEvent::LinkUp {
+            link,
+            peer,
+            cost: cost(10),
+        },
+    );
+    let (timer, at) = scheduled_spf(&initial);
+    assert_eq!(at.as_millis(), SPF_INITIAL_HOLD_MS);
+
+    for (received_at, seq) in [(10, 1), (20, 2), (30, 3)] {
+        let actions = plane.handle(
+            MonoTime::from_millis(received_at),
+            ControlEvent::Frame {
+                link,
+                frame: ControlFrame::Lsa(reciprocal_lsa(peer, me, seq)),
+            },
+        );
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            ControlAction::SetTimer {
+                timer: ControlTimer::SpfHold { .. },
+                ..
+            }
+        )));
+    }
+
+    let early = plane.handle(
+        MonoTime::from_millis(SPF_INITIAL_HOLD_MS - 1),
+        ControlEvent::Timer(timer),
+    );
+    assert_eq!(scheduled_spf(&early), (timer, at));
+    assert!(plane.route_table().is_empty());
+
+    let fired = plane.handle(at, ControlEvent::Timer(timer));
+    assert_eq!(
+        fired
+            .iter()
+            .filter(|action| matches!(action, ControlAction::PublishRoutes(_)))
+            .count(),
+        1
+    );
+    assert_eq!(plane.route_table().version, 1);
+    assert!(plane.route_table().get(&peer).is_some());
+}
+
+#[test]
+fn spf_hold_backs_off_to_the_cap_and_resets_after_quiet() {
+    let me = node(1);
+    let peer = node(2);
+    let link = LinkId::new(1);
+    let mut plane = ControlPlane::new_unsecured(me, 1);
+
+    let initial = plane.handle(
+        MonoTime::ZERO,
+        ControlEvent::LinkUp {
+            link,
+            peer,
+            cost: cost(10),
+        },
+    );
+    let (initial_timer, initial_at) = scheduled_spf(&initial);
+    plane.handle(initial_at, ControlEvent::Timer(initial_timer));
+
+    let mut now = initial_at.as_millis();
+    for (seq, expected_hold) in [200, 400, 800, 1_600, 3_200, 5_000, 5_000]
+        .into_iter()
+        .enumerate()
+    {
+        now += 1;
+        let actions = plane.handle(
+            MonoTime::from_millis(now),
+            ControlEvent::Frame {
+                link,
+                frame: ControlFrame::Lsa(reciprocal_lsa(peer, me, seq as u64 + 1)),
+            },
+        );
+        let (timer, at) = scheduled_spf(&actions);
+        assert_eq!(at.as_millis() - now, expected_hold);
+        assert!(expected_hold <= SPF_MAX_HOLD_MS);
+        now = at.as_millis();
+        plane.handle(at, ControlEvent::Timer(timer));
+    }
+
+    let after_quiet = now + SPF_QUIET_RESET_MS;
+    let actions = plane.handle(
+        MonoTime::from_millis(after_quiet),
+        ControlEvent::Frame {
+            link,
+            frame: ControlFrame::Lsa(reciprocal_lsa(peer, me, 100)),
+        },
+    );
+    let (_, at) = scheduled_spf(&actions);
+    assert_eq!(at.as_millis() - after_quiet, SPF_INITIAL_HOLD_MS);
+}
+
+#[test]
+fn stale_spf_generation_cannot_run_a_new_schedule() {
+    let me = node(1);
+    let peer = node(2);
+    let link = LinkId::new(1);
+    let mut plane = ControlPlane::new_unsecured(me, 1);
+
+    let initial = plane.handle(
+        MonoTime::ZERO,
+        ControlEvent::LinkUp {
+            link,
+            peer,
+            cost: cost(10),
+        },
+    );
+    let (old_timer, initial_at) = scheduled_spf(&initial);
+    plane.handle(initial_at, ControlEvent::Timer(old_timer));
+
+    let changed_at = initial_at.as_millis() + 1;
+    let changed = plane.handle(
+        MonoTime::from_millis(changed_at),
+        ControlEvent::Frame {
+            link,
+            frame: ControlFrame::Lsa(reciprocal_lsa(peer, me, 1)),
+        },
+    );
+    let (current_timer, current_at) = scheduled_spf(&changed);
+    assert_ne!(old_timer, current_timer);
+
+    assert!(plane
+        .handle(current_at, ControlEvent::Timer(old_timer))
+        .is_empty());
+    assert!(plane.route_table().get(&peer).is_none());
+
+    let current = plane.handle(current_at, ControlEvent::Timer(current_timer));
+    assert!(current
+        .iter()
+        .any(|action| matches!(action, ControlAction::PublishRoutes(_))));
+    assert!(plane.route_table().get(&peer).is_some());
+}
+
+#[test]
 fn periodic_digest_repairs_an_lsa_lost_during_initial_flooding() {
     let ids = [node(1), node(2)];
     let mut harness = Harness::new(&ids);
@@ -446,7 +651,7 @@ fn remote_lsa_becomes_a_permanent_compact_tombstone() {
     let peer = node(2);
     let link = LinkId::new(1);
     let mut plane = ControlPlane::new_unsecured(me, 1);
-    plane.handle(
+    let initial = plane.handle(
         MonoTime::ZERO,
         ControlEvent::LinkUp {
             link,
@@ -454,6 +659,7 @@ fn remote_lsa_becomes_a_permanent_compact_tombstone() {
             cost: cost(10),
         },
     );
+    let (initial_spf, initial_spf_at) = scheduled_spf(&initial);
     let received_at = MonoTime::from_millis(10);
     let peer_lsa = Lsa {
         origin: peer,
@@ -466,7 +672,7 @@ fn remote_lsa_becomes_a_permanent_compact_tombstone() {
         }],
     };
     let canonical_bytes: Arc<[u8]> = Arc::from([1_u8, 2, 3]);
-    plane.handle(
+    let receive_actions = plane.handle(
         received_at,
         ControlEvent::Frame {
             link,
@@ -477,11 +683,19 @@ fn remote_lsa_becomes_a_permanent_compact_tombstone() {
             }),
         },
     );
+    assert!(!receive_actions.iter().any(|action| matches!(
+        action,
+        ControlAction::SetTimer {
+            timer: ControlTimer::SpfHold { .. },
+            ..
+        }
+    )));
+    plane.handle(initial_spf_at, ControlEvent::Timer(initial_spf));
     assert!(plane.route_table().get(&peer).is_some());
     assert_eq!(Arc::strong_count(&canonical_bytes), 2);
 
     let expires_at = received_at.as_millis() + u64::from(DEFAULT_LSA_TTL_SEC) * 1_000;
-    plane.handle(
+    let expiry_actions = plane.handle(
         MonoTime::from_millis(expires_at),
         ControlEvent::Timer(ControlTimer::LsaExpire {
             origin: peer,
@@ -490,6 +704,9 @@ fn remote_lsa_becomes_a_permanent_compact_tombstone() {
         }),
     );
     assert_eq!(plane.lsa_is_expired(&peer), Some(true));
+    assert!(plane.route_table().get(&peer).is_some());
+    let (expiry_spf, expiry_spf_at) = scheduled_spf(&expiry_actions);
+    plane.handle(expiry_spf_at, ControlEvent::Timer(expiry_spf));
     assert!(plane.route_table().get(&peer).is_none());
     assert_eq!(Arc::strong_count(&canonical_bytes), 1);
 

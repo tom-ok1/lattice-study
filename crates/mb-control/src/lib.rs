@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
 
 pub const DIGEST_INTERVAL_MS: u64 = 10_000;
+pub const SPF_INITIAL_HOLD_MS: u64 = 100;
+pub const SPF_MAX_HOLD_MS: u64 = 5_000;
+pub const SPF_QUIET_RESET_MS: u64 = 10_000;
 pub const DEFAULT_LSA_TTL_SEC: u32 = 300;
 pub const MAX_LSA_TTL_SEC: u32 = 3_600;
 pub const MAX_LSDB_ENTRIES: usize = 1_000;
@@ -140,6 +143,9 @@ pub enum ControlFrame {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ControlTimer {
     Digest(LinkId),
+    SpfHold {
+        generation: u64,
+    },
     LsaRefresh {
         epoch: u32,
         seq: u64,
@@ -241,6 +247,12 @@ struct LocalAdjacency {
     cost: LinkCost,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingSpf {
+    generation: u64,
+    at: MonoTime,
+}
+
 pub struct ControlPlane {
     me: NodeId,
     epoch: u32,
@@ -248,6 +260,10 @@ pub struct ControlPlane {
     adjacencies: BTreeMap<LinkId, LocalAdjacency>,
     lsdb: BTreeMap<NodeId, LsdbEntry>,
     routes: Arc<RouteTable>,
+    pending_spf: Option<PendingSpf>,
+    spf_generation: u64,
+    spf_hold_ms: u64,
+    last_lsdb_change_at: Option<MonoTime>,
     signer: Box<dyn LsaSigner>,
     verifier: Box<dyn LsaVerifier>,
 }
@@ -292,6 +308,10 @@ impl ControlPlane {
             adjacencies: BTreeMap::new(),
             lsdb: BTreeMap::new(),
             routes: Arc::new(RouteTable::default()),
+            pending_spf: None,
+            spf_generation: 0,
+            spf_hold_ms: SPF_INITIAL_HOLD_MS,
+            last_lsdb_change_at: None,
             signer,
             verifier,
         }
@@ -359,11 +379,11 @@ impl ControlPlane {
 
         let mut actions = vec![ControlAction::PersistSeq(self.my_seq)];
         actions.extend(self.flood(&message, None));
-        if let Some(action) = self.recompute_routes() {
-            actions.push(action);
-        }
         actions.push(expiry);
         actions.push(Self::next_refresh_timer(now, &message.lsa));
+        if let Some(action) = self.mark_spf_dirty(now) {
+            actions.push(action);
+        }
         actions
     }
 
@@ -404,10 +424,10 @@ impl ControlPlane {
             return Vec::new();
         };
         let mut actions = self.flood(&message, Some(incoming));
-        if let Some(action) = self.recompute_routes() {
+        actions.push(expiry);
+        if let Some(action) = self.mark_spf_dirty(now) {
             actions.push(action);
         }
-        actions.push(expiry);
         actions
     }
 
@@ -627,6 +647,57 @@ impl ControlPlane {
             .get_mut(&origin)
             .expect("entry checked above")
             .state = LsdbEntryState::Tombstone;
+        self.mark_spf_dirty(now).into_iter().collect()
+    }
+
+    fn mark_spf_dirty(&mut self, now: MonoTime) -> Option<ControlAction> {
+        let was_quiet = self.last_lsdb_change_at.is_some_and(|last_change| {
+            now.as_millis().saturating_sub(last_change.as_millis()) >= SPF_QUIET_RESET_MS
+        });
+        self.last_lsdb_change_at = Some(now);
+
+        if was_quiet {
+            self.spf_hold_ms = SPF_INITIAL_HOLD_MS;
+        }
+
+        if self.pending_spf.is_some() && !was_quiet {
+            return None;
+        }
+
+        self.spf_generation = self
+            .spf_generation
+            .checked_add(1)
+            .expect("SPF timer generation exhausted");
+        let at = MonoTime::from_millis(now.as_millis().saturating_add(self.spf_hold_ms));
+        let pending = PendingSpf {
+            generation: self.spf_generation,
+            at,
+        };
+        self.pending_spf = Some(pending);
+        Some(ControlAction::SetTimer {
+            timer: ControlTimer::SpfHold {
+                generation: pending.generation,
+            },
+            at,
+        })
+    }
+
+    fn handle_spf_timer(&mut self, now: MonoTime, generation: u64) -> Vec<ControlAction> {
+        let Some(pending) = self.pending_spf else {
+            return Vec::new();
+        };
+        if pending.generation != generation {
+            return Vec::new();
+        }
+        if now < pending.at {
+            return vec![ControlAction::SetTimer {
+                timer: ControlTimer::SpfHold { generation },
+                at: pending.at,
+            }];
+        }
+
+        self.pending_spf = None;
+        self.spf_hold_ms = self.spf_hold_ms.saturating_mul(2).min(SPF_MAX_HOLD_MS);
         self.recompute_routes().into_iter().collect()
     }
 
@@ -774,6 +845,7 @@ impl Component for ControlPlane {
             },
             ControlEvent::Timer(timer) => match timer {
                 ControlTimer::Digest(link) => self.handle_digest_timer(now, link),
+                ControlTimer::SpfHold { generation } => self.handle_spf_timer(now, generation),
                 ControlTimer::LsaRefresh { epoch, seq } => {
                     self.handle_refresh_timer(now, epoch, seq)
                 }
