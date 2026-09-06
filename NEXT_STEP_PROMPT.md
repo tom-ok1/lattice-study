@@ -15,9 +15,11 @@
 - `mb-forward` の I/O なし `Component` 境界
 - `RouteTable` に従うユニキャスト転送、ローカル配送、TTL decrement
 - TTL exceeded、no route、incoming link への折り返し、未対応 packet type の明示的 drop
+- Link ごとの有限な P0〜P3 queue と incremental byte credit
+- P0 strict priority、P1〜P3 の決定的 DRR、queue overflow の Backpressure / drop
 - A-B-C の 2 hop 転送と Action 列の決定性テスト
 
-次の目的は、**Phase 2 の次の縦切りとして、Link ごとの有限な優先度キューと送信 credit を `mb-forward` に追加し、P3 が滞留していても P0 が先に送信されることを決定論テストで保証すること**です。
+次の目的は、**Phase 2 の次の縦切りとして P1 queue の Conflation を追加し、帯域待ちの間に同じキーの古い状態を最新 packet へ置き換えられるようにすること**です。
 
 まずドキュメントと依存関係を確認し、実装前に短く以下を示してください。
 
@@ -28,23 +30,22 @@
 
 有力なスコープは以下です。
 
-- `ForwardEvent::LinkCredit` と Link ごとの利用可能 byte credit を追加する
-- 即時 `Send` せず、next-hop の priority queue に packet を積む
-- P0 は厳密優先、P1〜P3 は決定的な DRR で選択する
-- 各 priority queue に packet 数または byte 数の明示的な上限を設ける
-- overflow を `Backpressure` または明示的な drop reason として返す
-- credit を超える packet は送信せず、次の credit 通知まで保持する
-- P3 を先に大量投入してから P0 を投入し、credit 付与時に P0 が先に `Send` されることを検証する
-- 同じ Event 列から同じ Action 列と queue 状態が得られることを検証する
+- `ForwardFlags::CONFLATABLE` が付いた P1 packet だけを Conflation 対象にする
+- key は payload を読まず `(source, flow_id, conflate_key)` から作る
+- 同じ key が queue 内にあれば、queue 位置を維持したまま最新 packet へ置換する
+- 置換時に `queued_bytes` を新しい packet sizeへ正しく更新する
+- 異なる key、P0/P2/P3、flagなし packetは置換しない
+- 同じ keyを1000回投入しても、credit付与後に最新packetだけが送られることを検証する
+- Conflation後もDRR、queue上限、Action列の決定性が維持されることを検証する
 
 必須の設計制約は次のとおりです。
 
 - `mb-forward` に `tokio`、socket、ファイル I/O、実時刻取得を入れない
 - packet priority は payload ではなく 88 byte header だけから判断する
-- キューは必ず有限にし、overflow 動作を型とテストで明示する
-- DRR の巡回順と tie-break を決定的にする
-- 既存のユニキャスト、TTL、no-route、loop 検知を壊さない
-- Conflation、Explicit Multicast、ECMP、Link Down 再キュー、P0 no-route 待機、runtime 接続は今回含めない
+- Conflation key は E2E 暗号化される可能性がある payload から導出しない
+- 新しい packetへの置換でqueue内の順序を変えない
+- 既存のcredit、P0 strict priority、DRR、queue overflowを壊さない
+- Explicit Multicast、ECMP、Link Down 再キュー、P0 no-route 待機、runtime 接続は今回含めない
 - 既存のユーザー変更を保持する
 
 実装後は少なくとも以下を実行してください。

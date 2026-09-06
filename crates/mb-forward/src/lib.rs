@@ -5,8 +5,12 @@
 
 use mb_control::RouteTable;
 use mb_types::{Component, LinkId, MonoTime, NodeId};
-use mb_wire::{ForwardPacket, PacketType};
+use mb_wire::{ForwardPacket, PacketType, Priority};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+
+pub const QUEUE_LIMIT_PACKETS: [usize; 4] = [256, 512, 1_024, 4_096];
+pub const DRR_QUANTUM_BYTES: [usize; 3] = [14 * 1_024, 5 * 1_024, 1_024];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DropReason {
@@ -14,6 +18,7 @@ pub enum DropReason {
     NoRoute,
     LoopDetected,
     UnsupportedPacketType(PacketType),
+    QueueFull(Priority),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,6 +26,7 @@ pub enum ForwardEvent {
     Outbound(ForwardPacket),
     Inbound { link: LinkId, packet: ForwardPacket },
     RoutesUpdated(Arc<RouteTable>),
+    LinkCredit { link: LinkId, bytes: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,16 +40,56 @@ pub enum ForwardAction {
         reason: DropReason,
         packet: ForwardPacket,
     },
+    Backpressure {
+        link: LinkId,
+        packet: ForwardPacket,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkQueueSnapshot {
+    pub available_credit_bytes: usize,
+    pub packet_counts: [usize; 4],
+    pub queued_bytes: [usize; 4],
+    pub deficit_bytes: [usize; 3],
+    pub next_drr_priority: Priority,
+}
+
+struct LinkQueues {
+    queues: [VecDeque<ForwardPacket>; 4],
+    queued_bytes: [usize; 4],
+    available_credit_bytes: usize,
+    deficit_bytes: [usize; 3],
+    next_drr: usize,
+    drr_needs_quantum: bool,
+}
+
+impl Default for LinkQueues {
+    fn default() -> Self {
+        Self {
+            queues: std::array::from_fn(|_| VecDeque::new()),
+            queued_bytes: [0; 4],
+            available_credit_bytes: 0,
+            deficit_bytes: [0; 3],
+            next_drr: 0,
+            drr_needs_quantum: true,
+        }
+    }
 }
 
 pub struct Forwarder {
     me: NodeId,
     routes: Arc<RouteTable>,
+    links: BTreeMap<LinkId, LinkQueues>,
 }
 
 impl Forwarder {
     pub fn new(me: NodeId, routes: Arc<RouteTable>) -> Self {
-        Self { me, routes }
+        Self {
+            me,
+            routes,
+            links: BTreeMap::new(),
+        }
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -52,6 +98,16 @@ impl Forwarder {
 
     pub fn route_table(&self) -> Arc<RouteTable> {
         Arc::clone(&self.routes)
+    }
+
+    pub fn queue_snapshot(&self, link: LinkId) -> Option<LinkQueueSnapshot> {
+        self.links.get(&link).map(|state| LinkQueueSnapshot {
+            available_credit_bytes: state.available_credit_bytes,
+            packet_counts: std::array::from_fn(|index| state.queues[index].len()),
+            queued_bytes: state.queued_bytes,
+            deficit_bytes: state.deficit_bytes,
+            next_drr_priority: drr_priority(state.next_drr),
+        })
     }
 
     fn forward(&self, incoming: Option<LinkId>, mut packet: ForwardPacket) -> ForwardAction {
@@ -90,6 +146,132 @@ impl Forwarder {
             packet,
         }
     }
+
+    fn process_packet(
+        &mut self,
+        incoming: Option<LinkId>,
+        packet: ForwardPacket,
+    ) -> Vec<ForwardAction> {
+        match self.forward(incoming, packet) {
+            ForwardAction::Send { link, packet } => self.enqueue(link, packet),
+            action => vec![action],
+        }
+    }
+
+    fn enqueue(&mut self, link: LinkId, packet: ForwardPacket) -> Vec<ForwardAction> {
+        let priority = packet.header.priority;
+        let queue_index = priority_index(priority);
+        let state = self.links.entry(link).or_default();
+        if state.queues[queue_index].len() >= QUEUE_LIMIT_PACKETS[queue_index] {
+            return if priority == Priority::P0 {
+                vec![ForwardAction::Backpressure { link, packet }]
+            } else {
+                vec![ForwardAction::Drop {
+                    reason: DropReason::QueueFull(priority),
+                    packet,
+                }]
+            };
+        }
+
+        state.queued_bytes[queue_index] =
+            state.queued_bytes[queue_index].saturating_add(packet.encoded_len());
+        state.queues[queue_index].push_back(packet);
+        self.drain_link(link)
+    }
+
+    fn grant_credit(&mut self, link: LinkId, bytes: usize) -> Vec<ForwardAction> {
+        let state = self.links.entry(link).or_default();
+        state.available_credit_bytes = state.available_credit_bytes.saturating_add(bytes);
+        self.drain_link(link)
+    }
+
+    fn drain_link(&mut self, link: LinkId) -> Vec<ForwardAction> {
+        let Some(state) = self.links.get_mut(&link) else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+
+        loop {
+            if let Some(packet_len) = state.queues[0].front().map(ForwardPacket::encoded_len) {
+                if packet_len > state.available_credit_bytes {
+                    break;
+                }
+                let packet = state.queues[0]
+                    .pop_front()
+                    .expect("P0 queue front was checked");
+                state.queued_bytes[0] = state.queued_bytes[0].saturating_sub(packet_len);
+                state.available_credit_bytes -= packet_len;
+                actions.push(ForwardAction::Send { link, packet });
+                continue;
+            }
+
+            let a_packet_fits_credit = state.queues[1..].iter().any(|queue| {
+                queue
+                    .front()
+                    .is_some_and(|packet| packet.encoded_len() <= state.available_credit_bytes)
+            });
+            if !a_packet_fits_credit {
+                break;
+            }
+
+            let drr_index = state.next_drr;
+            let queue_index = drr_index + 1;
+            if state.queues[queue_index].is_empty() {
+                state.deficit_bytes[drr_index] = 0;
+                advance_drr(state);
+                continue;
+            }
+            if state.drr_needs_quantum {
+                state.deficit_bytes[drr_index] =
+                    state.deficit_bytes[drr_index].saturating_add(DRR_QUANTUM_BYTES[drr_index]);
+                state.drr_needs_quantum = false;
+            }
+
+            let packet_len = state.queues[queue_index]
+                .front()
+                .expect("non-empty DRR queue was checked")
+                .encoded_len();
+            if packet_len > state.deficit_bytes[drr_index]
+                || packet_len > state.available_credit_bytes
+            {
+                advance_drr(state);
+                continue;
+            }
+
+            let packet = state.queues[queue_index]
+                .pop_front()
+                .expect("DRR queue front was checked");
+            state.deficit_bytes[drr_index] -= packet_len;
+            state.queued_bytes[queue_index] =
+                state.queued_bytes[queue_index].saturating_sub(packet_len);
+            state.available_credit_bytes -= packet_len;
+            actions.push(ForwardAction::Send { link, packet });
+            if state.queues[queue_index].is_empty() {
+                state.deficit_bytes[drr_index] = 0;
+                advance_drr(state);
+            }
+        }
+
+        actions
+    }
+}
+
+fn priority_index(priority: Priority) -> usize {
+    priority as usize
+}
+
+fn drr_priority(index: usize) -> Priority {
+    match index {
+        0 => Priority::P1,
+        1 => Priority::P2,
+        2 => Priority::P3,
+        _ => unreachable!("DRR index is always in 0..3"),
+    }
+}
+
+fn advance_drr(state: &mut LinkQueues) {
+    state.next_drr = (state.next_drr + 1) % 3;
+    state.drr_needs_quantum = true;
 }
 
 impl Component for Forwarder {
@@ -98,12 +280,13 @@ impl Component for Forwarder {
 
     fn handle(&mut self, _now: MonoTime, event: Self::Event) -> Vec<Self::Action> {
         match event {
-            ForwardEvent::Outbound(packet) => vec![self.forward(None, packet)],
-            ForwardEvent::Inbound { link, packet } => vec![self.forward(Some(link), packet)],
+            ForwardEvent::Outbound(packet) => self.process_packet(None, packet),
+            ForwardEvent::Inbound { link, packet } => self.process_packet(Some(link), packet),
             ForwardEvent::RoutesUpdated(routes) => {
                 self.routes = routes;
                 Vec::new()
             }
+            ForwardEvent::LinkCredit { link, bytes } => self.grant_credit(link, bytes),
         }
     }
 }
@@ -190,6 +373,25 @@ mod tests {
         let mut forwarder_c =
             Forwarder::new(c, route_table([(a, c_to_b, 20, 2), (b, c_to_b, 10, 1)]));
         let original = packet(a, c, 32);
+
+        assert!(forwarder_a
+            .handle(
+                MonoTime::ZERO,
+                ForwardEvent::LinkCredit {
+                    link: a_to_b,
+                    bytes: original.encoded_len(),
+                },
+            )
+            .is_empty());
+        assert!(forwarder_b
+            .handle(
+                MonoTime::ZERO,
+                ForwardEvent::LinkCredit {
+                    link: b_to_c,
+                    bytes: original.encoded_len(),
+                },
+            )
+            .is_empty());
 
         let at_b = expect_send(
             one_action(
@@ -306,6 +508,15 @@ mod tests {
                 ForwardEvent::RoutesUpdated(route_table([(b, link, 10, 1)])),
             )
             .is_empty());
+        assert!(forwarder
+            .handle(
+                MonoTime::from_millis(1),
+                ForwardEvent::LinkCredit {
+                    link,
+                    bytes: outbound.encoded_len(),
+                },
+            )
+            .is_empty());
 
         let sent = expect_send(
             one_action(
@@ -318,19 +529,220 @@ mod tests {
 
     #[test]
     fn identical_inputs_produce_identical_actions() {
-        fn run() -> Vec<ForwardAction> {
+        fn run() -> (Vec<ForwardAction>, Option<LinkQueueSnapshot>) {
             let [a, b] = [node(1), node(2)];
             let link = LinkId::new(1);
             let routes = route_table([(b, link, 10, 1)]);
             let mut forwarder = Forwarder::new(a, Arc::new(RouteTable::default()));
             let mut actions = forwarder.handle(MonoTime::ZERO, ForwardEvent::RoutesUpdated(routes));
             actions.extend(forwarder.handle(
+                MonoTime::ZERO,
+                ForwardEvent::LinkCredit {
+                    link,
+                    bytes: packet(a, b, 32).encoded_len(),
+                },
+            ));
+            actions.extend(forwarder.handle(
                 MonoTime::from_millis(1),
                 ForwardEvent::Outbound(packet(a, b, 32)),
             ));
-            actions
+            (actions, forwarder.queue_snapshot(link))
         }
 
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn packets_wait_until_enough_incremental_credit_is_available() {
+        let [a, b] = [node(1), node(2)];
+        let link = LinkId::new(1);
+        let mut forwarder = Forwarder::new(a, route_table([(b, link, 10, 1)]));
+        let outbound = packet(a, b, 32);
+        let packet_len = outbound.encoded_len();
+
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::Outbound(outbound))
+            .is_empty());
+        assert_eq!(
+            forwarder.queue_snapshot(link),
+            Some(LinkQueueSnapshot {
+                available_credit_bytes: 0,
+                packet_counts: [0, 1, 0, 0],
+                queued_bytes: [0, packet_len, 0, 0],
+                deficit_bytes: [0; 3],
+                next_drr_priority: Priority::P1,
+            })
+        );
+
+        assert!(forwarder
+            .handle(
+                MonoTime::from_millis(1),
+                ForwardEvent::LinkCredit {
+                    link,
+                    bytes: packet_len - 1,
+                },
+            )
+            .is_empty());
+        let sent = one_action(forwarder.handle(
+            MonoTime::from_millis(2),
+            ForwardEvent::LinkCredit { link, bytes: 1 },
+        ));
+        assert_eq!(expect_send(sent, link).header.ttl, 31);
+
+        let snapshot = forwarder
+            .queue_snapshot(link)
+            .expect("link queue state must remain observable");
+        assert_eq!(snapshot.available_credit_bytes, 0);
+        assert_eq!(snapshot.packet_counts, [0; 4]);
+        assert_eq!(snapshot.queued_bytes, [0; 4]);
+    }
+
+    #[test]
+    fn p0_is_sent_before_already_queued_p3() {
+        let [a, b] = [node(1), node(2)];
+        let link = LinkId::new(1);
+        let mut forwarder = Forwarder::new(a, route_table([(b, link, 10, 1)]));
+        let mut p3 = packet(a, b, 32);
+        p3.header.priority = Priority::P3;
+        p3.header.flow_id = 3;
+        let mut p0 = packet(a, b, 32);
+        p0.header.priority = Priority::P0;
+        p0.header.flow_id = 0;
+        let packet_len = p0.encoded_len();
+
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::Outbound(p3))
+            .is_empty());
+        assert!(forwarder
+            .handle(MonoTime::ZERO, ForwardEvent::Outbound(p0))
+            .is_empty());
+
+        let first = expect_send(
+            one_action(forwarder.handle(
+                MonoTime::from_millis(1),
+                ForwardEvent::LinkCredit {
+                    link,
+                    bytes: packet_len,
+                },
+            )),
+            link,
+        );
+        assert_eq!(first.header.priority, Priority::P0);
+        assert_eq!(
+            forwarder
+                .queue_snapshot(link)
+                .expect("queue must exist")
+                .packet_counts,
+            [0, 0, 0, 1]
+        );
+
+        let second = expect_send(
+            one_action(forwarder.handle(
+                MonoTime::from_millis(2),
+                ForwardEvent::LinkCredit {
+                    link,
+                    bytes: packet_len,
+                },
+            )),
+            link,
+        );
+        assert_eq!(second.header.priority, Priority::P3);
+    }
+
+    #[test]
+    fn drr_eventually_serves_every_non_empty_priority() {
+        let [a, b] = [node(1), node(2)];
+        let link = LinkId::new(1);
+        let mut forwarder = Forwarder::new(a, route_table([(b, link, 10, 1)]));
+        let priorities = [Priority::P1, Priority::P2, Priority::P3];
+        let mut total_bytes = 0;
+
+        for priority in priorities {
+            for sequence in 0..3 {
+                let mut queued = packet(a, b, 32);
+                queued.header.priority = priority;
+                queued.header.flow_id = priority_index(priority) as u64 * 10 + sequence;
+                queued.payload = Bytes::from(vec![sequence as u8; 2_048]);
+                total_bytes += queued.encoded_len();
+                assert!(forwarder
+                    .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+                    .is_empty());
+            }
+        }
+
+        let actions = forwarder.handle(
+            MonoTime::from_millis(1),
+            ForwardEvent::LinkCredit {
+                link,
+                bytes: total_bytes,
+            },
+        );
+        let sent_priorities = actions
+            .iter()
+            .map(|action| match action {
+                ForwardAction::Send { packet, .. } => packet.header.priority,
+                other => panic!("credit must only produce sends, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sent_priorities.len(), 9);
+        assert!(priorities
+            .into_iter()
+            .all(|priority| sent_priorities.contains(&priority)));
+        assert_eq!(
+            forwarder
+                .queue_snapshot(link)
+                .expect("queue must exist")
+                .packet_counts,
+            [0; 4]
+        );
+    }
+
+    #[test]
+    fn bounded_queues_report_backpressure_or_drop() {
+        let [a, b] = [node(1), node(2)];
+        let link = LinkId::new(1);
+        let mut forwarder = Forwarder::new(a, route_table([(b, link, 10, 1)]));
+
+        for _ in 0..QUEUE_LIMIT_PACKETS[0] {
+            let mut queued = packet(a, b, 32);
+            queued.header.priority = Priority::P0;
+            assert!(forwarder
+                .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+                .is_empty());
+        }
+        let mut overflow_p0 = packet(a, b, 32);
+        overflow_p0.header.priority = Priority::P0;
+        assert!(matches!(
+            one_action(forwarder.handle(
+                MonoTime::ZERO,
+                ForwardEvent::Outbound(overflow_p0)
+            )),
+            ForwardAction::Backpressure { link: target, .. } if target == link
+        ));
+
+        for _ in 0..QUEUE_LIMIT_PACKETS[2] {
+            let mut queued = packet(a, b, 32);
+            queued.header.priority = Priority::P2;
+            assert!(forwarder
+                .handle(MonoTime::ZERO, ForwardEvent::Outbound(queued))
+                .is_empty());
+        }
+        let mut overflow_p2 = packet(a, b, 32);
+        overflow_p2.header.priority = Priority::P2;
+        assert!(matches!(
+            one_action(forwarder.handle(MonoTime::ZERO, ForwardEvent::Outbound(overflow_p2))),
+            ForwardAction::Drop {
+                reason: DropReason::QueueFull(Priority::P2),
+                ..
+            }
+        ));
+
+        assert_eq!(
+            forwarder
+                .queue_snapshot(link)
+                .expect("queue must exist")
+                .packet_counts,
+            [QUEUE_LIMIT_PACKETS[0], 0, QUEUE_LIMIT_PACKETS[2], 0]
+        );
     }
 }

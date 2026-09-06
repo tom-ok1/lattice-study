@@ -114,6 +114,12 @@ pub struct ForwardPacket {
     pub payload: Bytes,
 }
 
+impl ForwardPacket {
+    pub fn encoded_len(&self) -> usize {
+        FORWARD_HEADER_LEN.saturating_add(self.payload.len())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ForwardPacketError {
     HeaderTooShort(usize),
