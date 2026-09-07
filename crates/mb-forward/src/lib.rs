@@ -79,9 +79,8 @@ pub enum ForwardAction {
     },
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct LinkQueueSnapshot {
+pub struct LinkQueueSnapshot {
     pub available_credit_bytes: usize,
     pub packet_counts: [usize; 4],
     pub queued_bytes: [usize; 4],
@@ -180,8 +179,8 @@ impl Forwarder {
             .sum()
     }
 
-    #[cfg(test)]
-    fn queue_snapshot(&self, link: LinkId) -> Option<LinkQueueSnapshot> {
+    /// Returns bounded scheduler state for diagnostics without exposing queues.
+    pub fn queue_snapshot(&self, link: LinkId) -> Option<LinkQueueSnapshot> {
         self.links.get(&link).map(|state| LinkQueueSnapshot {
             available_credit_bytes: state.available_credit_bytes,
             packet_counts: std::array::from_fn(|index| state.queues[index].len()),
@@ -736,7 +735,6 @@ fn priority_index(priority: Priority) -> usize {
     priority as usize
 }
 
-#[cfg(test)]
 fn drr_priority(index: usize) -> Priority {
     match index {
         0 => Priority::P1,

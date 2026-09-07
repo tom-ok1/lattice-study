@@ -333,6 +333,14 @@ impl ControlPlane {
         self.lsdb.len()
     }
 
+    /// Returns active LSAs in stable origin order for diagnostics and Admin APIs.
+    pub fn lsas(&self) -> impl Iterator<Item = &Lsa> {
+        self.lsdb
+            .values()
+            .filter_map(LsdbEntry::active)
+            .map(|active| &active.message.lsa)
+    }
+
     pub fn lsa(&self, origin: &NodeId) -> Option<&Lsa> {
         self.lsdb
             .get(origin)

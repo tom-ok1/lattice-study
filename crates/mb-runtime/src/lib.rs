@@ -3,10 +3,12 @@
 use bytes::Bytes;
 use mb_control::{
     Adjacency, ControlAction, ControlEvent, ControlFrame, ControlPlane, ControlTimer, DigestEntry,
-    InvalidLinkCost, LinkCost, Lsa, LsaMessage, MAX_DIGEST_ENTRIES, MAX_DIGEST_REQ_ORIGINS,
-    MAX_LSA_ADJACENCIES, MAX_LSA_TTL_SEC,
+    InvalidLinkCost, LinkCost, Lsa, LsaMessage, RouteTable, MAX_DIGEST_ENTRIES,
+    MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSA_TTL_SEC,
 };
-use mb_forward::{DropReason, ForwardAction, ForwardEvent, ForwardTimer, Forwarder};
+use mb_forward::{
+    DropReason, ForwardAction, ForwardEvent, ForwardTimer, Forwarder, LinkQueueSnapshot,
+};
 use mb_transport::{LinkEvent, TcpEndpoint, TransportError};
 use mb_types::{Component, LinkId, MonoTime, NodeId};
 use mb_wire::{
@@ -15,19 +17,21 @@ use mb_wire::{
 };
 use prost::Message;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 
 const FORWARD_INPUT_CAPACITY: usize = 256;
 const FORWARD_OUTCOME_CAPACITY: usize = 256;
+const RECENT_EVENT_LIMIT: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeqStoreError(String);
@@ -171,11 +175,47 @@ pub struct RuntimeConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeEvent {
+    pub sequence: u64,
+    pub at: MonoTime,
+    pub kind: &'static str,
+    pub detail: String,
+    pub link: Option<LinkId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeSnapshot {
+    pub node_id: NodeId,
+    pub now: MonoTime,
+    pub peers: BTreeMap<LinkId, NodeId>,
+    pub lsas: Vec<Lsa>,
+    pub routes: Arc<RouteTable>,
+    pub queues: BTreeMap<LinkId, LinkQueueSnapshot>,
+    pub recent_events: Vec<RuntimeEvent>,
+}
+
+impl RuntimeSnapshot {
+    fn empty(node_id: NodeId, routes: Arc<RouteTable>) -> Self {
+        Self {
+            node_id,
+            now: MonoTime::ZERO,
+            peers: BTreeMap::new(),
+            lsas: Vec::new(),
+            routes,
+            queues: BTreeMap::new(),
+            recent_events: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ForwardOutcome {
     Delivered(ForwardPacket),
     Dropped {
         reason: DropReason,
-        packet: ForwardPacket,
+        priority: Priority,
+        flow_id: u64,
+        source: NodeId,
     },
     Backpressure {
         link: LinkId,
@@ -191,10 +231,64 @@ enum ForwardInput {
     },
 }
 
-struct RuntimeChannels {
+struct RuntimeInbox {
     link_events: mpsc::Receiver<LinkEvent>,
     forward_inputs: mpsc::Receiver<ForwardInput>,
+    timers: BinaryHeap<Reverse<(u64, u64, RuntimeTimer)>>,
+    started_at: Instant,
+    next_timer_sequence: u64,
+}
+
+impl RuntimeInbox {
+    fn new(
+        link_events: mpsc::Receiver<LinkEvent>,
+        forward_inputs: mpsc::Receiver<ForwardInput>,
+    ) -> Self {
+        Self {
+            link_events,
+            forward_inputs,
+            timers: BinaryHeap::new(),
+            started_at: Instant::now(),
+            next_timer_sequence: 0,
+        }
+    }
+
+    fn now(&self) -> MonoTime {
+        MonoTime::from_millis(elapsed_millis(self.started_at))
+    }
+
+    fn schedule(&mut self, timer: RuntimeTimer, at: MonoTime) {
+        self.timers
+            .push(Reverse((at.as_millis(), self.next_timer_sequence, timer)));
+        self.next_timer_sequence = self.next_timer_sequence.wrapping_add(1);
+    }
+
+    async fn recv(&mut self) -> Option<RuntimeInput> {
+        if let Some(Reverse((at_ms, _, timer))) = self.timers.peek().copied() {
+            if at_ms <= elapsed_millis(self.started_at) {
+                self.timers.pop();
+                return Some(RuntimeInput::Timer(timer));
+            }
+        }
+
+        let next_timer_at = self.timers.peek().map(|Reverse((at_ms, _, _))| *at_ms);
+        tokio::select! {
+            link_event = self.link_events.recv() => link_event.map(RuntimeInput::Link),
+            forward_input = self.forward_inputs.recv() => forward_input.map(RuntimeInput::Forward),
+            _ = wait_for_timer(self.started_at, next_timer_at) => {
+                let Reverse((_, _, timer)) = self.timers.pop()?;
+                Some(RuntimeInput::Timer(timer))
+            }
+        }
+    }
+}
+
+struct RuntimeServices {
     forward_outcomes: mpsc::Sender<ForwardOutcome>,
+    seq_store: Arc<dyn SeqStore>,
+    peer_costs: Arc<RwLock<BTreeMap<NodeId, LinkCost>>>,
+    snapshots: watch::Sender<RuntimeSnapshot>,
+    diagnostics_enabled: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -299,8 +393,11 @@ impl From<SeqStoreError> for RuntimeError {
 /// Handle for sending packets, observing state, and stopping one mesh runtime.
 pub struct ControlRuntime {
     endpoint: TcpEndpoint,
+    peer_costs: Arc<RwLock<BTreeMap<NodeId, LinkCost>>>,
     forward_inputs: mpsc::Sender<ForwardInput>,
     forward_outcomes: Option<mpsc::Receiver<ForwardOutcome>>,
+    snapshots: watch::Receiver<RuntimeSnapshot>,
+    diagnostics_enabled: Arc<AtomicBool>,
     driver: JoinHandle<()>,
 }
 
@@ -337,33 +434,81 @@ impl ControlRuntime {
         }
         let plane =
             ControlPlane::new_unsecured_with_seq(config.node_id, config.epoch, persisted_seq);
+        let peer_costs = Arc::new(RwLock::new(config.peer_costs.clone()));
         let (forward_input_tx, forward_input_rx) = mpsc::channel(FORWARD_INPUT_CAPACITY);
         let (forward_outcome_tx, forward_outcome_rx) = mpsc::channel(FORWARD_OUTCOME_CAPACITY);
+        let (snapshot_tx, snapshot_rx) =
+            watch::channel(RuntimeSnapshot::empty(config.node_id, plane.route_table()));
+        let diagnostics_enabled = Arc::new(AtomicBool::new(false));
         let driver_endpoint = endpoint.clone();
-        let channels = RuntimeChannels {
-            link_events: events,
-            forward_inputs: forward_input_rx,
+        let inbox = RuntimeInbox::new(events, forward_input_rx);
+        let services = RuntimeServices {
             forward_outcomes: forward_outcome_tx,
+            seq_store,
+            peer_costs: Arc::clone(&peer_costs),
+            snapshots: snapshot_tx,
+            diagnostics_enabled: Arc::clone(&diagnostics_enabled),
         };
         let driver = tokio::spawn(run_runtime_loop(
             config,
             plane,
             driver_endpoint,
-            channels,
-            seq_store,
+            inbox,
+            services,
         ));
         Ok(Self {
             endpoint,
+            peer_costs,
             forward_inputs: forward_input_tx,
             forward_outcomes: Some(forward_outcome_rx),
+            snapshots: snapshot_rx,
+            diagnostics_enabled,
             driver,
         })
     }
 
-    /// Transfers the reliable, single-consumer application egress to the
-    /// caller. Pub/Sub or another upper layer should drain this receiver.
+    /// Transfers the single-consumer application egress to the caller.
+    /// Delivered packets and backpressure returns are reliable; drop reports
+    /// are lightweight and best-effort so congestion cannot stall the runtime.
     pub fn take_forward_outcomes(&mut self) -> Option<mpsc::Receiver<ForwardOutcome>> {
         self.forward_outcomes.take()
+    }
+
+    /// Returns the latest diagnostic snapshot. Call `enable_diagnostics`
+    /// before links become active to keep it updated.
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        self.snapshots.borrow().clone()
+    }
+
+    /// Subscribes to diagnostic snapshots produced after diagnostics are enabled.
+    pub fn subscribe_snapshots(&self) -> watch::Receiver<RuntimeSnapshot> {
+        self.snapshots.clone()
+    }
+
+    /// Enables the bounded diagnostic event log and full runtime snapshots.
+    /// Production callers that do not opt in avoid formatting and cloning
+    /// diagnostic state on the forwarding hot path.
+    pub fn enable_diagnostics(&self) {
+        self.diagnostics_enabled.store(true, Ordering::Relaxed);
+    }
+
+    pub async fn allow_peer(&self, peer: NodeId, cost: LinkCost) {
+        self.peer_costs.write().await.insert(peer, cost);
+        self.endpoint.allow_peer(peer).await;
+    }
+
+    pub async fn connect(
+        &self,
+        peer: NodeId,
+        peer_addr: std::net::SocketAddr,
+        cost: LinkCost,
+    ) -> Result<LinkId, RuntimeError> {
+        self.allow_peer(peer, cost).await;
+        Ok(self.endpoint.connect(peer, peer_addr).await?)
+    }
+
+    pub async fn close_link(&self, link: LinkId) -> Result<(), RuntimeError> {
+        Ok(self.endpoint.close(link).await?)
     }
 
     pub async fn send(&self, packet: ForwardPacket) -> Result<(), RuntimeError> {
@@ -404,29 +549,24 @@ async fn run_runtime_loop(
     config: RuntimeConfig,
     mut plane: ControlPlane,
     endpoint: TcpEndpoint,
-    channels: RuntimeChannels,
-    seq_store: Arc<dyn SeqStore>,
+    mut inbox: RuntimeInbox,
+    services: RuntimeServices,
 ) {
-    let RuntimeChannels {
-        link_events,
-        forward_inputs,
+    let RuntimeServices {
         forward_outcomes,
-    } = channels;
-    let mut events = link_events;
-    let mut forward_inputs = forward_inputs;
-    let started_at = Instant::now();
+        seq_store,
+        peer_costs,
+        snapshots,
+        diagnostics_enabled,
+    } = services;
     let mut forwarder = Forwarder::new(config.node_id, plane.route_table());
-    let mut timers = BinaryHeap::<Reverse<(u64, u64, RuntimeTimer)>>::new();
-    let mut next_timer_sequence = 0_u64;
+    let mut peers = BTreeMap::<LinkId, NodeId>::new();
+    let mut recent_events = VecDeque::<RuntimeEvent>::new();
+    let mut next_event_sequence = 0_u64;
 
-    loop {
-        let Some(input) =
-            next_runtime_input(started_at, &mut events, &mut forward_inputs, &mut timers).await
-        else {
-            break;
-        };
-
-        let now = MonoTime::from_millis(elapsed_millis(started_at));
+    while let Some(input) = inbox.recv().await {
+        let now = inbox.now();
+        let diagnostics_enabled = diagnostics_enabled.load(Ordering::Relaxed);
         let mut control_event = None;
         let mut forward_actions = Vec::new();
 
@@ -438,12 +578,36 @@ async fn run_runtime_loop(
                 forward_actions.extend(forwarder.handle(now, ForwardEvent::Timer(timer)));
             }
             RuntimeInput::Forward(ForwardInput::Outbound(packet)) => {
+                if diagnostics_enabled {
+                    push_runtime_event(
+                        &mut recent_events,
+                        &mut next_event_sequence,
+                        now,
+                        "ORIGINATE",
+                        packet_summary(&packet),
+                        None,
+                    );
+                }
                 forward_actions.extend(forwarder.handle(now, ForwardEvent::Outbound(packet)));
             }
             RuntimeInput::Forward(ForwardInput::OutboundMulticast {
                 destinations,
                 packet,
             }) => {
+                if diagnostics_enabled {
+                    push_runtime_event(
+                        &mut recent_events,
+                        &mut next_event_sequence,
+                        now,
+                        "MULTICAST",
+                        format!(
+                            "{} destinations · {}",
+                            destinations.len(),
+                            packet_summary(&packet)
+                        ),
+                        None,
+                    );
+                }
                 forward_actions.extend(forwarder.handle(
                     now,
                     ForwardEvent::OutboundMulticast {
@@ -453,10 +617,21 @@ async fn run_runtime_loop(
                 ));
             }
             RuntimeInput::Link(LinkEvent::Up { link, peer }) => {
-                let Some(cost) = config.peer_costs.get(&peer).copied() else {
+                let Some(cost) = peer_costs.read().await.get(&peer).copied() else {
                     let _ = endpoint.close(link).await;
                     continue;
                 };
+                peers.insert(link, peer);
+                if diagnostics_enabled {
+                    push_runtime_event(
+                        &mut recent_events,
+                        &mut next_event_sequence,
+                        now,
+                        "LINK_UP",
+                        format!("link {} · peer {peer}", link.get()),
+                        Some(link),
+                    );
+                }
                 forward_actions.extend(forwarder.handle(
                     now,
                     ForwardEvent::LinkCredit {
@@ -468,6 +643,17 @@ async fn run_runtime_loop(
                 control_event = Some(ControlEvent::LinkUp { link, peer, cost });
             }
             RuntimeInput::Link(LinkEvent::Down { link }) => {
+                let peer = peers.remove(&link);
+                if diagnostics_enabled {
+                    push_runtime_event(
+                        &mut recent_events,
+                        &mut next_event_sequence,
+                        now,
+                        "LINK_DOWN",
+                        format!("link {} · peer {peer:?}", link.get()),
+                        Some(link),
+                    );
+                }
                 forward_actions.extend(forwarder.handle(now, ForwardEvent::LinkDown(link)));
                 control_event = Some(ControlEvent::LinkDown { link });
             }
@@ -519,19 +705,39 @@ async fn run_runtime_loop(
                         let Ok(wire_frame) = encode_control_frame(&frame) else {
                             continue;
                         };
+                        if diagnostics_enabled {
+                            let (kind, detail) = control_frame_summary(&frame);
+                            push_runtime_event(
+                                &mut recent_events,
+                                &mut next_event_sequence,
+                                now,
+                                kind,
+                                detail,
+                                Some(link),
+                            );
+                        }
                         if endpoint.send(link, wire_frame).await.is_err() {
                             let _ = endpoint.close(link).await;
                         }
                     }
                     ControlAction::SetTimer { timer, at } => {
-                        timers.push(Reverse((
-                            at.as_millis(),
-                            next_timer_sequence,
-                            RuntimeTimer::Control(timer),
-                        )));
-                        next_timer_sequence = next_timer_sequence.wrapping_add(1);
+                        inbox.schedule(RuntimeTimer::Control(timer), at);
                     }
                     ControlAction::PublishRoutes(routes) => {
+                        if diagnostics_enabled {
+                            push_runtime_event(
+                                &mut recent_events,
+                                &mut next_event_sequence,
+                                now,
+                                "SPF",
+                                format!(
+                                    "route table v{} · {} routes",
+                                    routes.version,
+                                    routes.len()
+                                ),
+                                None,
+                            );
+                        }
                         forward_actions
                             .extend(forwarder.handle(now, ForwardEvent::RoutesUpdated(routes)));
                     }
@@ -546,15 +752,110 @@ async fn run_runtime_loop(
             }
         }
 
-        execute_forward_actions(
-            &endpoint,
-            &forward_outcomes,
-            &mut timers,
-            &mut next_timer_sequence,
-            forward_actions,
-        )
-        .await;
+        if diagnostics_enabled {
+            for action in &forward_actions {
+                let (kind, detail, link) = match action {
+                    ForwardAction::Send { link, packet } => (
+                        "PACKET_SEND",
+                        format!("link {} · {}", link.get(), packet_summary(packet)),
+                        Some(*link),
+                    ),
+                    ForwardAction::DeliverLocal(packet) => {
+                        ("PACKET_DELIVER", packet_summary(packet), None)
+                    }
+                    ForwardAction::Drop { reason, packet } => (
+                        "PACKET_DROP",
+                        format!("{reason:?} · {}", packet_summary(packet)),
+                        None,
+                    ),
+                    ForwardAction::Backpressure { link, packet } => (
+                        "BACKPRESSURE",
+                        format!("link {} · {}", link.get(), packet_summary(packet)),
+                        Some(*link),
+                    ),
+                    ForwardAction::SetTimer { .. } => continue,
+                };
+                push_runtime_event(
+                    &mut recent_events,
+                    &mut next_event_sequence,
+                    now,
+                    kind,
+                    detail,
+                    link,
+                );
+            }
+        }
+
+        execute_forward_actions(&endpoint, &forward_outcomes, &mut inbox, forward_actions).await;
+
+        if diagnostics_enabled {
+            let queues = peers
+                .keys()
+                .filter_map(|link| forwarder.queue_snapshot(*link).map(|queue| (*link, queue)))
+                .collect();
+            snapshots.send_replace(RuntimeSnapshot {
+                node_id: config.node_id,
+                now,
+                peers: peers.clone(),
+                lsas: plane.lsas().cloned().collect(),
+                routes: plane.route_table(),
+                queues,
+                recent_events: recent_events.iter().cloned().collect(),
+            });
+        }
     }
+}
+
+fn packet_summary(packet: &ForwardPacket) -> String {
+    format!(
+        "{:?} · flow {} · {} → {} · {} bytes",
+        packet.header.priority,
+        packet.header.flow_id,
+        packet.header.source,
+        packet.header.destination,
+        packet.payload.len()
+    )
+}
+
+fn control_frame_summary(frame: &ControlFrame) -> (&'static str, String) {
+    match frame {
+        ControlFrame::Lsa(message) => (
+            "LSA_SEND",
+            format!(
+                "origin {} · epoch {} · seq {} · {} adjacencies",
+                message.lsa.origin,
+                message.lsa.epoch,
+                message.lsa.seq,
+                message.lsa.adjacencies.len()
+            ),
+        ),
+        ControlFrame::Digest(entries) => ("DIGEST_SEND", format!("{} LSDB entries", entries.len())),
+        ControlFrame::DigestReq(origins) => (
+            "DIGEST_REQ_SEND",
+            format!("{} requested origins", origins.len()),
+        ),
+    }
+}
+
+fn push_runtime_event(
+    events: &mut VecDeque<RuntimeEvent>,
+    next_sequence: &mut u64,
+    at: MonoTime,
+    kind: &'static str,
+    detail: String,
+    link: Option<LinkId>,
+) {
+    if events.len() == RECENT_EVENT_LIMIT {
+        events.pop_front();
+    }
+    events.push_back(RuntimeEvent {
+        sequence: *next_sequence,
+        at,
+        kind,
+        detail,
+        link,
+    });
+    *next_sequence = next_sequence.wrapping_add(1);
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -567,30 +868,6 @@ enum RuntimeInput {
     Link(LinkEvent),
     Forward(ForwardInput),
     Timer(RuntimeTimer),
-}
-
-async fn next_runtime_input(
-    started_at: Instant,
-    events: &mut mpsc::Receiver<LinkEvent>,
-    forward_inputs: &mut mpsc::Receiver<ForwardInput>,
-    timers: &mut BinaryHeap<Reverse<(u64, u64, RuntimeTimer)>>,
-) -> Option<RuntimeInput> {
-    if let Some(Reverse((at_ms, _, timer))) = timers.peek().copied() {
-        if at_ms <= elapsed_millis(started_at) {
-            timers.pop();
-            return Some(RuntimeInput::Timer(timer));
-        }
-    }
-
-    let next_timer_at = timers.peek().map(|Reverse((at_ms, _, _))| *at_ms);
-    tokio::select! {
-        link_event = events.recv() => link_event.map(RuntimeInput::Link),
-        forward_input = forward_inputs.recv() => forward_input.map(RuntimeInput::Forward),
-        _ = wait_for_timer(started_at, next_timer_at) => {
-            let Reverse((_, _, timer)) = timers.pop()?;
-            Some(RuntimeInput::Timer(timer))
-        }
-    }
 }
 
 async fn wait_for_timer(started_at: Instant, at_ms: Option<u64>) {
@@ -609,8 +886,7 @@ fn elapsed_millis(started_at: Instant) -> u64 {
 async fn execute_forward_actions(
     endpoint: &TcpEndpoint,
     outcomes: &mpsc::Sender<ForwardOutcome>,
-    timers: &mut BinaryHeap<Reverse<(u64, u64, RuntimeTimer)>>,
-    next_timer_sequence: &mut u64,
+    inbox: &mut RuntimeInbox,
     actions: Vec<ForwardAction>,
 ) {
     for action in actions {
@@ -632,9 +908,7 @@ async fn execute_forward_actions(
                 let _ = outcomes.send(ForwardOutcome::Delivered(packet)).await;
             }
             ForwardAction::Drop { reason, packet } => {
-                let _ = outcomes
-                    .send(ForwardOutcome::Dropped { reason, packet })
-                    .await;
+                report_drop(outcomes, reason, packet);
             }
             ForwardAction::Backpressure { link, packet } => {
                 let _ = outcomes
@@ -642,15 +916,24 @@ async fn execute_forward_actions(
                     .await;
             }
             ForwardAction::SetTimer { timer, at } => {
-                timers.push(Reverse((
-                    at.as_millis(),
-                    *next_timer_sequence,
-                    RuntimeTimer::Forward(timer),
-                )));
-                *next_timer_sequence = next_timer_sequence.wrapping_add(1);
+                inbox.schedule(RuntimeTimer::Forward(timer), at);
             }
         }
     }
+}
+
+fn report_drop(outcomes: &mpsc::Sender<ForwardOutcome>, reason: DropReason, packet: ForwardPacket) {
+    let priority = packet.header.priority;
+    let flow_id = packet.header.flow_id;
+    let source = packet.header.source;
+    drop(packet);
+
+    let _ = outcomes.try_send(ForwardOutcome::Dropped {
+        reason,
+        priority,
+        flow_id,
+        source,
+    });
 }
 
 fn channel_for_priority(priority: Priority) -> Channel {
@@ -868,6 +1151,76 @@ mod tests {
         let mut bytes = [0; 32];
         bytes[31] = value;
         NodeId::from_bytes(bytes)
+    }
+
+    fn forward_packet(priority: Priority, payload: Bytes) -> ForwardPacket {
+        ForwardPacket {
+            header: mb_wire::ForwardHeader {
+                packet_type: PacketType::Unicast,
+                priority,
+                ttl: 32,
+                flags: mb_wire::ForwardFlags::empty(),
+                destination: node(2),
+                source: node(1),
+                flow_id: 42,
+                conflate_key: 0,
+            },
+            multicast_destinations: Vec::new(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn drop_report_contains_only_packet_identity() {
+        let (outcomes, mut receiver) = mpsc::channel(1);
+        let payload = Bytes::from(vec![7; 1_024]);
+        let retained = payload.clone();
+
+        report_drop(
+            &outcomes,
+            DropReason::LinkDown,
+            forward_packet(Priority::P3, payload),
+        );
+
+        assert_eq!(
+            receiver.try_recv().expect("drop report must be emitted"),
+            ForwardOutcome::Dropped {
+                reason: DropReason::LinkDown,
+                priority: Priority::P3,
+                flow_id: 42,
+                source: node(1),
+            }
+        );
+        assert!(
+            retained.try_into_mut().is_ok(),
+            "the dropped packet payload must not be retained by the outcome"
+        );
+    }
+
+    #[test]
+    fn drop_report_is_discarded_when_the_outcome_channel_is_full() {
+        let (outcomes, mut receiver) = mpsc::channel(1);
+        outcomes
+            .try_send(ForwardOutcome::Delivered(forward_packet(
+                Priority::P0,
+                Bytes::new(),
+            )))
+            .expect("channel must have room for the first outcome");
+
+        report_drop(
+            &outcomes,
+            DropReason::QueueFull(Priority::P3),
+            forward_packet(Priority::P3, Bytes::from_static(b"discarded")),
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ForwardOutcome::Delivered(_))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

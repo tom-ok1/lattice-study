@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 const LINK_QUEUE_CAPACITY: usize = 8;
@@ -123,7 +123,7 @@ enum LinkCommand {
 struct Inner {
     local_node: NodeId,
     local_addr: SocketAddr,
-    allowed_peers: BTreeSet<NodeId>,
+    allowed_peers: RwLock<BTreeSet<NodeId>>,
     next_link: AtomicU64,
     links: Mutex<BTreeMap<LinkId, mpsc::Sender<LinkCommand>>>,
     events: mpsc::Sender<LinkEvent>,
@@ -152,7 +152,7 @@ impl TcpEndpoint {
         let inner = Arc::new(Inner {
             local_node,
             local_addr,
-            allowed_peers: allowed_peers.into_iter().collect(),
+            allowed_peers: RwLock::new(allowed_peers.into_iter().collect()),
             next_link: AtomicU64::new(1),
             links: Mutex::new(BTreeMap::new()),
             events: event_tx,
@@ -181,12 +181,23 @@ impl TcpEndpoint {
         self.inner.link_count.subscribe()
     }
 
+    /// Adds a peer to the local allowlist used for subsequent connections.
+    pub async fn allow_peer(&self, peer: NodeId) {
+        self.inner.allowed_peers.write().await.insert(peer);
+    }
+
     pub async fn connect(
         &self,
         expected_peer: NodeId,
         peer_addr: SocketAddr,
     ) -> Result<LinkId, TransportError> {
-        if !self.inner.allowed_peers.contains(&expected_peer) {
+        if !self
+            .inner
+            .allowed_peers
+            .read()
+            .await
+            .contains(&expected_peer)
+        {
             return Err(TransportError::PeerNotAllowed(expected_peer));
         }
         let stream = TcpStream::connect(peer_addr).await?;
@@ -278,7 +289,7 @@ async fn attach_stream(
             });
         }
     }
-    if !inner.allowed_peers.contains(&peer) {
+    if !inner.allowed_peers.read().await.contains(&peer) {
         return Err(TransportError::PeerNotAllowed(peer));
     }
 

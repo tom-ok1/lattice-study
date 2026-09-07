@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mesh Lab</title>
+  <style>
+    :root{color-scheme:dark;--bg:#090e14;--panel:#101720;--panel2:#151f2a;--line:#273442;--text:#e7edf4;--muted:#8998a8;--green:#37d6a1;--blue:#61a8ff;--amber:#f3b64c;--red:#ef6d76;font:13px Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);overflow:hidden}button,select,input{font:inherit;color:inherit}button{cursor:pointer}.shell{height:100vh;display:grid;grid-template-rows:54px minmax(0,1fr);background:var(--bg)}header{display:flex;align-items:center;gap:12px;padding:0 15px;border-bottom:1px solid var(--line);background:#0e151d}.brand{font-weight:750;display:flex;align-items:center;gap:9px;font-size:14px}.mark{width:27px;height:27px;border-radius:8px;background:#132a24;border:1px solid #27604f;display:grid;place-items:center;color:var(--green)}.status{font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:7px;padding:5px 9px}.status b{color:var(--green)}.spacer{flex:1}.action{height:31px;border:1px solid var(--line);background:var(--panel2);border-radius:7px;padding:0 10px}.action:hover{border-color:#4b6073}.primary{background:var(--green);border-color:var(--green);color:#06241b;font-weight:700}.danger{background:#381e24;border-color:#673039;color:#ff949a}.layout{display:grid;grid-template-columns:210px minmax(420px,1fr) 285px;min-height:0}.sidebar,.inspector{background:var(--panel);overflow:auto}.sidebar{border-right:1px solid var(--line)}.inspector{border-left:1px solid var(--line)}.section{padding:14px;border-bottom:1px solid var(--line)}.label{font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:750;margin-bottom:9px;display:flex;justify-content:space-between}.node-row{width:100%;border:1px solid transparent;background:transparent;border-radius:7px;padding:8px;display:grid;grid-template-columns:9px 1fr auto;gap:8px;text-align:left;align-items:center}.node-row:hover{background:var(--panel2)}.node-row.selected{background:#172c43;border-color:#31577e}.dot{width:8px;height:8px;border-radius:50%;background:var(--green)}.dot.down{background:var(--red)}.dot.wait{background:var(--amber);animation:pulse 1s infinite}.small{font-size:10px;color:var(--muted)}.wide{width:100%;margin-top:8px}.faults{display:grid;gap:7px}select{height:32px;width:100%;border:1px solid var(--line);border-radius:7px;background:var(--panel2);padding:0 7px}.main{min-width:0;display:grid;grid-template-rows:minmax(0,1fr) 190px}.canvas{position:relative;overflow:hidden;background-image:linear-gradient(rgba(62,82,101,.17) 1px,transparent 1px),linear-gradient(90deg,rgba(62,82,101,.17) 1px,transparent 1px);background-size:24px 24px}.banner{position:absolute;z-index:2;top:11px;left:11px;padding:7px 10px;border:1px solid var(--line);background:rgba(16,23,32,.94);border-radius:7px;font-size:11px}.banner strong{color:var(--green);margin-right:7px}.banner.busy strong{color:var(--amber)}svg{width:100%;height:100%}.edge{stroke:#607184;stroke-width:2}.edge.down{stroke:var(--red);stroke-dasharray:5 5}.edge.bad{stroke:var(--amber);stroke-dasharray:8 5}.edge.selected{stroke:var(--blue);stroke-width:3}.edge-hit{stroke:transparent;stroke-width:18;cursor:pointer}.edge-label{fill:var(--muted);font-size:10px;text-anchor:middle;paint-order:stroke;stroke:var(--bg);stroke-width:5}.node{cursor:pointer}.node circle.core{fill:var(--panel2);stroke:var(--green);stroke-width:2}.node.down circle.core{stroke:var(--red);opacity:.7}.node.selected circle.core{stroke:var(--blue);stroke-width:3}.node text.name{fill:var(--text);font-size:11px;text-anchor:middle;font-weight:700}.node text.meta{fill:var(--muted);font-size:9px;text-anchor:middle}.packet{filter:drop-shadow(0 0 5px currentColor)}.events{border-top:1px solid var(--line);background:var(--panel);display:grid;grid-template-columns:1fr 210px;min-height:0}.event-pane{padding:10px 12px;overflow:hidden}.event-list{overflow:auto;height:145px}.event{display:grid;grid-template-columns:58px 92px 1fr;gap:8px;padding:4px 3px;font-size:10px}.event:hover{background:var(--panel2)}.event .time{color:#66788a}.event .kind{color:var(--blue);font-weight:700}.event .detail{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.summary{border-left:1px solid var(--line);padding:12px}.metric{margin:12px 0}.metric-head{display:flex;justify-content:space-between;color:var(--muted);font-size:10px;margin-bottom:5px}.bar{height:5px;background:#202c39;border-radius:4px;overflow:hidden}.bar i{display:block;height:100%;background:var(--blue);border-radius:4px}.title{font-size:15px;font-weight:750;margin-bottom:3px}.subtitle{color:var(--muted);font-size:10px}.health{margin-top:11px;padding:8px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);display:flex;gap:7px;align-items:center}.facts{display:grid;gap:9px}.fact{display:flex;justify-content:space-between}.fact span:first-child{color:var(--muted)}.routes{display:grid;gap:5px}.route{display:grid;grid-template-columns:1fr auto auto;gap:8px;padding:5px 0;border-bottom:1px solid var(--line);font-size:10px}.route .via{color:var(--blue)}.buttons{display:grid;grid-template-columns:1fr 1fr;gap:7px}.buttons button:last-child{grid-column:1/-1}.control{margin-bottom:12px}.control label{display:flex;justify-content:space-between;color:var(--muted);font-size:10px}.control input{width:100%;accent-color:var(--blue)}.empty{padding:24px;color:var(--muted)}@keyframes pulse{50%{opacity:.35}}@media(max-width:900px){.layout{grid-template-columns:180px 1fr}.inspector{display:none}}
+  </style>
+  <style>
+    .outcome-list{display:grid;gap:7px;max-height:260px;overflow:auto}
+    .outcome{padding:7px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);font-size:10px}
+    .outcome-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:4px}
+    .outcome-kind{color:var(--green);font-weight:750}.outcome-kind.DROPPED{color:var(--red)}.outcome-kind.BACKPRESSURE{color:var(--amber)}
+    .outcome-meta,.outcome-detail{color:var(--muted)}.outcome-payload{margin-top:5px;color:var(--text);overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+    .probe-status{padding:8px;border:1px solid #27604f;border-radius:6px;background:#132a24;color:var(--green);font-size:10px}.probe-status.error{border-color:#673039;background:#381e24;color:#ff949a}
+    .form-stack{display:grid;gap:8px}.form-stack label{color:var(--muted);font-size:10px}.form-stack input[type="number"]{height:32px;width:100%;margin-top:4px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);padding:0 8px}
+    button:disabled{cursor:not-allowed;opacity:.45}
+    .traffic-legend{position:absolute;z-index:2;right:11px;top:11px;display:flex;gap:9px;padding:7px 9px;border:1px solid var(--line);background:rgba(16,23,32,.94);border-radius:7px;font-size:10px;color:var(--muted)}
+    .traffic-legend i{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:4px}.pace-info{padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);font-size:10px;color:var(--muted)}.pace-info b{color:var(--text)}
+  </style>
+</head>
+<body>
+<div class="shell">
+  <header><div class="brand"><span class="mark">⌬</span>Mesh Lab</div><div class="status"><b>●</b> <span id="process-count">starting…</span></div><div class="spacer"></div><button class="action" id="refresh">↻ Refresh</button><button class="action primary" id="add-node">＋ Add node</button></header>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="section"><div class="label">Scenario</div><select><option>Live local mesh · real TCP</option></select><div class="label" style="margin-top:14px">Simulation pace</div><select id="pace"><option value="0">Realtime</option><option value="120">Observable · 120 ms/frame</option><option value="220">Slow · 220 ms/frame</option><option value="450">Very slow · 450 ms/frame</option><option value="900">Demo · 900 ms/frame</option></select></div>
+      <div class="section"><div class="label"><span>Nodes</span><span id="node-count">0</span></div><div id="node-list"></div></div>
+      <div class="section"><div class="label">Fault injection</div><div class="faults"><select id="fault"><option value="crash">Crash selected node</option><option value="partition">Disconnect selected link</option><option value="degrade">Degrade selected link</option></select><button class="action danger wide" id="inject">⚡ Inject fault</button></div></div>
+    </aside>
+    <main class="main">
+      <div class="canvas"><div class="banner" id="banner"><strong>Connecting</strong><span>waiting for node snapshots</span></div><div class="traffic-legend"><span><i style="background:#61a8ff"></i>LSA</span><span><i style="background:#b58cff"></i>Digest</span><span><i style="background:#37d6a1"></i>Packet</span><span><i style="background:#f3b64c"></i>Request</span></div><svg id="graph" viewBox="0 0 760 480" aria-label="Mesh topology"></svg></div>
+      <div class="events"><div class="event-pane"><div class="label"><span>Live event stream</span><span>Control · Routing · Forwarding</span></div><div class="event-list" id="events"></div></div><div class="summary"><div class="label">Mesh status</div><div class="metric"><div class="metric-head"><span>Running processes</span><span id="running-value">0/0</span></div><div class="bar"><i id="running-bar" style="width:0%"></i></div></div><div class="metric"><div class="metric-head"><span>Route coverage</span><span id="route-value">0%</span></div><div class="bar"><i id="route-bar" style="width:0%;background:var(--green)"></i></div></div><div class="metric"><div class="metric-head"><span>Queued packets</span><span id="queue-value">0</span></div><div class="bar"><i id="queue-bar" style="width:0%;background:var(--amber)"></i></div></div></div></div>
+    </main>
+    <aside class="inspector" id="inspector"><div class="empty">Select a node or link</div></aside>
+  </div>
+</div>
+<script>
+const app={state:{nodes:[],links:[],events:[],converged:false,components:0,now_ms:0,pace_ms:0},selection:null,polling:true,probeStatus:null,probeTargets:{},linkTargets:{},packetFlows:{},editingLink:false,renderedSelection:null,lastInspectorRender:0,nodeListSignature:null,graphSignature:null};
+const $=s=>document.querySelector(s),svg=$('#graph'),ns='http://www.w3.org/2000/svg';
+function api(path,options={}){return fetch(path,{headers:{'content-type':'application/json'},...options}).then(async r=>{const body=await r.text();if(!r.ok)throw new Error(body||`${r.status} ${r.statusText}`);return body?JSON.parse(body):null})}
+function position(i,n){const a=-Math.PI/2+i*Math.PI*2/Math.max(n,1),rx=255,ry=160;return{x:380+Math.cos(a)*rx,y:242+Math.sin(a)*ry}}
+function node(id){return app.state.nodes.find(n=>n.id===id)}
+function link(id){return app.state.links.find(l=>l.id===id)}
+function short(id){return `N${id}`}
+function selectionKey(){return app.selection?`${app.selection.type}:${app.selection.id}`:''}
+function captureInspectorScroll(){const box=$('#inspector'),same=app.renderedSelection===selectionKey();if(!same)return null;return{outer:box.scrollTop,lists:[...box.querySelectorAll('[data-scroll-key]')].map(list=>({key:list.dataset.scrollKey,top:list.scrollTop,atTop:list.scrollTop<4,bottom:list.scrollHeight-list.scrollTop}))}}
+function restoreInspectorScroll(saved){if(!saved)return;const box=$('#inspector');box.scrollTop=saved.outer;saved.lists.forEach(value=>{const list=box.querySelector(`[data-scroll-key="${value.key}"]`);if(list)list.scrollTop=value.atTop?0:Math.max(0,list.scrollHeight-value.bottom)})}
+function render(){const now=performance.now(),selectionChanged=app.renderedSelection!==selectionKey(),updateInspector=!app.editingLink&&(selectionChanged||now-app.lastInspectorRender>=500),scroll=updateInspector?captureInspectorScroll():null;renderList();renderGraph();renderEffectiveLinkLabels();renderEvents();if(updateInspector){renderInspector();renderOutcomePanel();renderLinkPacePanel();restoreInspectorScroll(scroll);app.renderedSelection=selectionKey();app.lastInspectorRender=now}renderStatus();renderPace()}
+function renderList(){const signature=JSON.stringify(app.state.nodes.map(n=>[n.id,n.name])),list=$('#node-list');if(signature!==app.nodeListSignature){app.nodeListSignature=signature;list.replaceChildren();app.state.nodes.forEach(n=>{const b=document.createElement('button');b.dataset.nodeId=n.id;b.innerHTML=`<i class="dot"></i><span>${n.name}</span><span class="small"></span>`;b.onclick=()=>{app.selection={type:'node',id:n.id};render()};list.append(b)})}app.state.nodes.forEach(n=>{const b=list.querySelector(`[data-node-id="${n.id}"]`);if(!b)return;b.className='node-row '+(app.selection?.type==='node'&&app.selection.id===n.id?'selected':'');b.querySelector('.dot').className=`dot ${n.running?'':'down'}`;b.querySelector('.small').textContent=n.running?(n.snapshot?.routes.length||0)+'r':'down'});$('#node-count').textContent=app.state.nodes.length}
+function se(name,attrs={}){const e=document.createElementNS(ns,name);Object.entries(attrs).forEach(([k,v])=>e.setAttribute(k,v));return e}
+function renderGraph(){
+  const points=new Map(app.state.nodes.map((n,i)=>[n.id,position(i,app.state.nodes.length)])),signature=JSON.stringify([app.state.nodes.map(n=>[n.id,n.name,n.running]),app.state.links.map(l=>[l.id,l.a,l.b,l.up,l.cost,l.latency_ms,l.loss_percent,l.bandwidth_kbps])]);
+  if(signature!==app.graphSignature){
+    app.graphSignature=signature;svg.replaceChildren();const edges=se('g'),packets=se('g',{id:'packets'}),nodes=se('g');
+    app.state.links.forEach(l=>{const a=points.get(l.a),b=points.get(l.b);if(!a||!b)return;const bad=l.loss_percent>=10||l.latency_ms>=200||(l.bandwidth_kbps>0&&l.bandwidth_kbps<=100),selected=app.selection?.type==='link'&&app.selection.id===l.id;edges.append(se('line',{x1:a.x,y1:a.y,x2:b.x,y2:b.y,'data-link-id':l.id,class:`edge ${l.up?'':'down'} ${bad?'bad':''} ${selected?'selected':''}`}));const hit=se('line',{x1:a.x,y1:a.y,x2:b.x,y2:b.y,class:'edge-hit'});hit.onclick=()=>{app.selection={type:'link',id:l.id};render()};edges.append(hit);const label=se('text',{x:(a.x+b.x)/2,y:(a.y+b.y)/2-8,class:'edge-label'});label.textContent=l.up?`cost ${l.cost} · ${l.latency_ms} ms · ${l.loss_percent}%`:`LINK DOWN · cost ${l.cost}`;edges.append(label)});
+    app.state.nodes.forEach((n,i)=>{const p=points.get(n.id),g=se('g',{'data-node-id':n.id,class:`node ${n.running?'':'down'} ${app.selection?.type==='node'&&app.selection.id===n.id?'selected':''}`,transform:`translate(${p.x} ${p.y})`});g.onclick=()=>{app.selection={type:'node',id:n.id};render()};g.append(se('circle',{class:'core',r:28}));const icon=se('text',{x:0,y:5,class:'name'});icon.textContent=short(n.id);g.append(icon);const name=se('text',{x:0,y:48,class:'name'});name.textContent=n.name;g.append(name);const meta=se('text',{x:0,y:62,class:'meta'});meta.textContent=n.running?`${n.snapshot?.routes.length||0} routes · LSDB ${n.snapshot?.lsdb.length||0}`:'process stopped';g.append(meta);nodes.append(g)});svg.append(edges,packets,nodes);
+  }else{$('#packets')?.replaceChildren()}
+  app.state.nodes.forEach(n=>{const g=svg.querySelector(`g.node[data-node-id="${n.id}"]`);if(!g)return;g.setAttribute('class',`node ${n.running?'':'down'} ${app.selection?.type==='node'&&app.selection.id===n.id?'selected':''}`);g.querySelector('text.meta').textContent=n.running?`${n.snapshot?.routes.length||0} routes · LSDB ${n.snapshot?.lsdb.length||0}`:'process stopped'});
+  app.state.links.forEach(l=>{const edge=svg.querySelector(`.edge[data-link-id="${l.id}"]`);if(!edge)return;const bad=l.loss_percent>=10||l.latency_ms>=200||(l.bandwidth_kbps>0&&l.bandwidth_kbps<=100),selected=app.selection?.type==='link'&&app.selection.id===l.id;edge.setAttribute('class',`edge ${l.up?'':'down'} ${bad?'bad':''} ${selected?'selected':''}`)});
+  animateNewPackets(points);
+}
+function animateNewPackets(points){
+  const styles={LSA_SEND:{color:'#61a8ff',label:'L'},DIGEST_SEND:{color:'#b58cff',label:'D'},DIGEST_REQ_SEND:{color:'#f3b64c',label:'R'},PACKET_SEND:{color:'#37d6a1',label:'P'}};
+  app.state.events.filter(e=>styles[e.kind]&&e.kind!=='PACKET_SEND'&&e.peer!=null).slice(0,60).reverse().forEach(e=>{
+    const logical=app.state.links.find(l=>l.up&&((l.a===e.node&&l.b===e.peer)||(l.b===e.node&&l.a===e.peer)));if(!logical)return;
+    const a=points.get(e.node),b=points.get(e.peer);if(!a||!b)return;
+    const animationSpeed=.7,duration=Math.max(600,(app.state.pace_ms||0)+logical.latency_ms)/animationSpeed,age=Math.max(0,app.state.now_ms-e.at_ms);if(age>duration+500)return;
+    const style=styles[e.kind],g=se('g',{class:'packet'}),c=se('circle',{r:5,fill:style.color}),label=se('text',{x:0,y:-9,fill:style.color,'font-size':9,'text-anchor':'middle','font-weight':800});label.textContent=style.label;g.append(c,label);g.setAttribute('transform',`translate(${a.x} ${a.y})`);$('#packets')?.append(g);
+    const start=performance.now();
+    function step(now){const t=Math.min(1,(age+now-start)/duration),x=a.x+(b.x-a.x)*t,y=a.y+(b.y-a.y)*t;g.setAttribute('transform',`translate(${x} ${y})`);if(t<1&&g.isConnected)requestAnimationFrame(step);else g.remove()}
+    requestAnimationFrame(step);
+  });
+  animateProbePackets(points,styles.PACKET_SEND);
+}
+function packetFlowId(event){return event.detail.match(/\bflow (\d+)\b/)?.[1]}
+function eventLink(event){return app.state.links.find(l=>(l.a===event.node&&l.b===event.peer)||(l.b===event.node&&l.a===event.peer))}
+function packetHopDuration(event){const logical=eventLink(event);return Math.max(80,(app.state.pace_ms||0)+(logical?.latency_ms||0))}
+function syncProbePlayback(){
+  const now=performance.now(),grouped={};
+  app.state.events.filter(e=>e.kind==='PACKET_SEND'&&e.peer!=null).sort((a,b)=>a.at_ms-b.at_ms||a.node-b.node||a.sequence-b.sequence).forEach(event=>{const flow=packetFlowId(event);if(flow)(grouped[flow]??=[]).push(event)});
+  Object.entries(grouped).forEach(([flow,events])=>{
+    const playback=app.packetFlows[flow]??={originAt:events[0].at_ms,startedAt:now,entries:[],keys:{},lastAdded:now};
+    events.forEach(event=>{
+      const key=`${event.node}:${event.sequence}`;if(playback.keys[key])return;
+      const previous=playback.entries.at(-1),actualStart=playback.startedAt+Math.max(0,event.at_ms-playback.originAt),start=Math.max(now,actualStart,previous?.end||0),duration=packetHopDuration(event);
+      playback.entries.push({key,event,start,end:start+duration,duration});playback.keys[key]=true;playback.lastAdded=now;
+    });
+  });
+  Object.entries(app.packetFlows).forEach(([flow,playback])=>{if(!grouped[flow]&&now-playback.lastAdded>10000)delete app.packetFlows[flow]});
+}
+function animateProbePackets(points,style){
+  syncProbePlayback();const now=performance.now();
+  Object.entries(app.packetFlows).forEach(([flow,playback])=>playback.entries.forEach((entry,hop)=>{
+    if(now>entry.end+100)return;const a=points.get(entry.event.node),b=points.get(entry.event.peer);if(!a||!b)return;
+    const g=se('g',{class:'packet','data-kind':'PACKET_SEND','data-flow':flow,'data-hop':hop}),c=se('circle',{r:5,fill:style.color}),label=se('text',{x:0,y:-9,fill:style.color,'font-size':9,'text-anchor':'middle','font-weight':800});label.textContent=style.label;g.append(c,label);g.style.visibility='hidden';$('#packets')?.append(g);
+    function step(frameNow){if(!g.isConnected)return;if(frameNow<entry.start){requestAnimationFrame(step);return}g.style.visibility='visible';const t=Math.min(1,(frameNow-entry.start)/entry.duration),x=a.x+(b.x-a.x)*t,y=a.y+(b.y-a.y)*t;g.setAttribute('transform',`translate(${x} ${y})`);if(t<1)requestAnimationFrame(step);else g.remove()}
+    requestAnimationFrame(step);
+  }));
+}
+function renderEffectiveLinkLabels(){document.querySelectorAll('.edge-label').forEach((label,index)=>{const l=app.state.links[index];if(l?.up)label.textContent=`cost ${l.cost} · ${(app.state.pace_ms||0)+l.latency_ms} ms · ${l.loss_percent}% loss`})}
+function renderEvents(){const box=$('#events');box.replaceChildren();app.state.events.slice(0,30).forEach(e=>{const r=document.createElement('div');r.className='event';const time=(e.at_ms/1000).toFixed(3)+'s';r.innerHTML=`<span class="time">${time}</span><span class="kind">${e.kind}</span><span class="detail">${e.name} · ${e.detail}</span>`;box.append(r)})}
+function renderStatus(){const total=app.state.nodes.length,running=app.state.nodes.filter(n=>n.running).length,maxRoutes=Math.max(1,total*(total-1)),routes=app.state.nodes.reduce((s,n)=>s+(n.snapshot?.routes.length||0),0),queued=app.state.nodes.reduce((s,n)=>s+(n.snapshot?.queues||[]).reduce((q,x)=>q+x.packets.reduce((a,b)=>a+b,0),0),0),coverage=Math.round(routes/maxRoutes*100),downLinks=app.state.links.filter(l=>!l.up).length,impairedLinks=app.state.links.filter(l=>l.up&&(l.latency_ms>0||l.loss_percent>0||l.bandwidth_kbps>0)).length,offline=total-running;$('#process-count').textContent=`${running} live processes`;$('#running-value').textContent=`${running}/${total}`;$('#running-bar').style.width=`${total?running/total*100:0}%`;$('#route-value').textContent=`${coverage}%`;$('#route-bar').style.width=`${coverage}%`;$('#queue-value').textContent=queued;$('#queue-bar').style.width=`${Math.min(100,queued)}%`;const banner=$('#banner');banner.classList.toggle('busy',!app.state.converged);if(!app.state.converged){banner.innerHTML='<strong>Reconverging</strong><span>LSDB generations, adjacencies, or route tables do not match the active topology</span>';return}const facts=['control plane matches active topology'];if(app.state.components>1)facts.push(`${app.state.components} network components`);if(downLinks)facts.push(`${downLinks} link${downLinks===1?'':'s'} down`);if(impairedLinks)facts.push(`${impairedLinks} impaired link${impairedLinks===1?'':'s'}`);if(offline)facts.push(`${offline} process${offline===1?'':'es'} offline`);banner.innerHTML=`<strong>Converged</strong><span>${facts.join(' · ')}</span>`}
+function nodeOptions(nodes,selected){return nodes.map(n=>`<option value="${n.id}" ${n.id===selected?'selected':''}>${n.name} (${short(n.id)})</option>`).join('')}
+function selectTarget(store,source,targets){if(!targets.some(n=>n.id===store[source]))store[source]=targets[0]?.id;return store[source]}
+function renderInspector(){
+  const box=$('#inspector'),sel=app.selection;
+  if(!sel){box.innerHTML='<div class="empty">Select a node or link</div>';return}
+  if(sel.type==='node'){
+    const n=node(sel.id);if(!n)return;
+    const routes=(n.snapshot?.routes||[]).map(r=>`<div class="route"><span>${node(r.destination)?.name||short(r.destination)}</span><span class="via">link ${r.next_hop}</span><span>${r.cost}</span></div>`).join('');
+    const probeTargets=app.state.nodes.filter(candidate=>candidate.running&&candidate.id!==n.id),probeTarget=selectTarget(app.probeTargets,n.id,probeTargets);
+    const linkTargets=app.state.nodes.filter(candidate=>candidate.running&&candidate.id!==n.id&&!app.state.links.some(l=>(l.a===n.id&&l.b===candidate.id)||(l.b===n.id&&l.a===candidate.id))),linkTarget=selectTarget(app.linkTargets,n.id,linkTargets);
+    box.innerHTML=`
+      <div class="section"><div class="label">Node inspector</div><div class="title">${n.name}</div><div class="subtitle">PID ${n.pid||'—'} · ${n.mesh_addr}</div><div class="health"><i class="dot ${n.running?'':'down'}"></i>${n.running?'Healthy process':'Process stopped'}</div></div>
+      <div class="section"><div class="label">Control plane</div><div class="facts"><div class="fact"><span>LSDB entries</span><b>${n.snapshot?.lsdb.length||0}</b></div><div class="fact"><span>Routes</span><b>${n.snapshot?.routes.length||0}</b></div><div class="fact"><span>Peers</span><b>${n.snapshot?.peers.length||0}</b></div><div class="fact"><span>Uptime</span><b>${((n.snapshot?.now_ms||0)/1000).toFixed(1)}s</b></div></div></div>
+      <div class="section"><div class="label">Routes</div><div class="routes">${routes||'<span class="small">No routes</span>'}</div></div>
+      <div class="section"><div class="label">Send probe from ${short(n.id)}</div><div class="form-stack"><select id="probe-target" ${probeTargets.length?'':'disabled'}>${nodeOptions(probeTargets,probeTarget)}</select><button class="action primary" id="send" ${n.running&&probeTargets.length?'':'disabled'}>▶ Send probe</button></div></div>
+      <div class="section"><div class="label">Create real TCP link</div><div class="form-stack"><select id="link-target" ${linkTargets.length?'':'disabled'}>${nodeOptions(linkTargets,linkTarget)}</select><label>Routing cost<input id="link-cost" type="number" min="1" max="65535" value="10"></label><button class="action" id="create-link" ${n.running&&linkTargets.length?'':'disabled'}>＋ Create link from ${short(n.id)}</button>${linkTargets.length?'':'<span class="small">This node is already linked to every running node.</span>'}</div></div>
+      <div class="section"><div class="buttons"><button class="action" id="restart">↻ Restart</button><button class="action danger" id="crash">Crash process</button><button class="action danger" id="remove">Remove node</button></div></div>`;
+    $('#probe-target').onchange=e=>app.probeTargets[n.id]=+e.target.value;
+    $('#link-target').onchange=e=>app.linkTargets[n.id]=+e.target.value;
+    $('#send').onclick=()=>sendProbe(n.id,+$('#probe-target').value);
+    $('#create-link').onclick=()=>createLink(n.id,+$('#link-target').value,+$('#link-cost').value);
+    $('#restart').onclick=()=>mutate(`/api/nodes/${n.id}/restart`,{method:'POST'});
+    $('#crash').onclick=()=>mutate(`/api/nodes/${n.id}/crash`,{method:'POST'});
+    $('#remove').onclick=()=>mutate(`/api/nodes/${n.id}`,{method:'DELETE'},()=>app.selection=null);
+  }else{
+    const l=link(sel.id);if(!l)return;
+    box.innerHTML=`<div class="section"><div class="label">Link inspector</div><div class="title">${node(l.a)?.name} ↔ ${node(l.b)?.name}</div><div class="subtitle">real TCP link · ${l.up?'connected':'disconnected'}</div><div class="health"><i class="dot ${l.up?'':'down'}"></i>${l.up?'Link active':'Link down'}</div><div class="facts" style="margin-top:11px"><div class="fact"><span>Routing cost</span><b>${l.cost}</b></div></div></div><div class="section"><div class="label">Network conditions</div><div class="control"><label>Latency <output id="latency-out">${l.latency_ms} ms</output></label><input id="latency" type="range" min="0" max="600" value="${l.latency_ms}"></div><div class="control"><label>Frame loss <output id="loss-out">${l.loss_percent}%</output></label><input id="loss" type="range" min="0" max="70" step="0.5" value="${l.loss_percent}"></div><div class="control"><label>Bandwidth <output id="bandwidth-out">${l.bandwidth_kbps||'∞'} kb/s</output></label><input id="bandwidth" type="range" min="0" max="10000" step="20" value="${l.bandwidth_kbps}"></div><button class="action primary wide" id="apply">Apply conditions</button></div><div class="section"><button class="action danger wide" id="toggle">${l.up?'Disconnect link':'Reconnect link'}</button></div>`;
+    ['latency','loss','bandwidth'].forEach(id=>$('#'+id).oninput=e=>$('#'+id+'-out').textContent=(id==='loss'?e.target.value+'%':id==='bandwidth'?(+e.target.value||'∞')+' kb/s':e.target.value+' ms'));
+    $('#apply').onclick=()=>mutate(`/api/links/${l.id}/conditions`,{method:'PATCH',body:JSON.stringify({latency_ms:+$('#latency').value,loss_percent:+$('#loss').value,bandwidth_kbps:+$('#bandwidth').value})});
+    $('#toggle').onclick=()=>mutate(`/api/links/${l.id}/toggle`,{method:'POST'});
+  }
+}
+function renderOutcomePanel(){
+  if(app.selection?.type!=='node')return;
+  const n=node(app.selection.id),box=$('#inspector');
+  if(!n)return;
+  const send=$('#send');if(send&&!n.running)send.textContent='Process stopped';
+  if(app.probeStatus?.source===n.id){
+    const statusSection=document.createElement('div');statusSection.className='section';
+    const status=document.createElement('div');status.className=`probe-status ${app.probeStatus.ok?'':'error'}`;status.textContent=app.probeStatus.message;
+    statusSection.append(status);box.append(statusSection);
+  }
+  const eventSection=document.createElement('div');eventSection.className='section';
+  eventSection.innerHTML='<div class="label"><span>Node event log</span><span>Latest 30</span></div>';
+  const eventList=document.createElement('div');eventList.className='outcome-list';eventList.dataset.scrollKey='node-events';eventList.tabIndex=0;eventList.setAttribute('aria-label','Node event log entries');
+  const events=[...(n.snapshot?.events||[])].reverse().slice(0,30);
+  events.forEach(e=>{
+    const row=document.createElement('div');row.className='outcome';
+    const head=document.createElement('div');head.className='outcome-head';
+    const kind=document.createElement('span');kind.className='outcome-kind';kind.textContent=e.kind;
+    const time=document.createElement('span');time.className='outcome-meta';time.textContent=`${(e.at_ms/1000).toFixed(3)}s`;
+    const detail=document.createElement('div');detail.className='outcome-detail';detail.textContent=e.detail;
+    head.append(kind,time);row.append(head,detail);eventList.append(row);
+  });
+  if(!events.length){const empty=document.createElement('span');empty.className='small';empty.textContent=n.running?'No node events yet':'Process stopped';eventList.append(empty)}
+  eventSection.append(eventList);box.append(eventSection);
+  const section=document.createElement('div');section.className='section';
+  section.innerHTML='<div class="label"><span>Terminal outcomes</span><span>Latest 30</span></div>';
+  const list=document.createElement('div');list.className='outcome-list';list.dataset.scrollKey='terminal-outcomes';list.tabIndex=0;list.setAttribute('aria-label','Terminal outcome entries');
+  const outcomes=[...(n.snapshot?.outcomes||[])].reverse().slice(0,30);
+  outcomes.forEach(o=>{
+    const row=document.createElement('div');row.className='outcome';
+    const head=document.createElement('div');head.className='outcome-head';
+    const kind=document.createElement('span');kind.className=`outcome-kind ${o.kind}`;kind.textContent=o.kind;
+    const time=document.createElement('span');time.className='outcome-meta';time.textContent=`${(o.at_ms/1000).toFixed(3)}s`;
+    head.append(kind,time);
+    const meta=document.createElement('div');meta.className='outcome-meta';const route=o.destination==null?short(o.source):`${short(o.source)} → ${short(o.destination)}`;const size=o.payload_bytes==null?'':` · ${o.payload_bytes} bytes`;meta.textContent=`P${o.priority} · flow ${o.flow_id} · ${route}${size}`;
+    const detail=document.createElement('div');detail.className='outcome-detail';detail.textContent=o.detail;
+    row.append(head,meta,detail);
+    if(o.payload_preview){const payload=document.createElement('div');payload.className='outcome-payload';payload.textContent=o.payload_preview;row.append(payload)}
+    list.append(row);
+  });
+  if(!outcomes.length){const empty=document.createElement('span');empty.className='small';empty.textContent=n.running?'No terminal outcomes. Sends are shown in the node event log; delivery appears on the destination node.':'Process stopped';list.append(empty)}
+  section.append(list);box.append(section);
+}
+function renderLinkPacePanel(){if(app.selection?.type!=='link')return;const l=link(app.selection.id),box=$('#inspector');if(!l)return;const section=document.createElement('div');section.className='section';const info=document.createElement('div');info.className='pace-info';info.innerHTML=`Common simulation pace <b>${app.state.pace_ms||0} ms</b><br>Additional fault latency <b>${l.latency_ms} ms</b><br>Effective frame delay <b>${(app.state.pace_ms||0)+l.latency_ms} ms</b>`;section.append(info);box.append(section)}
+function renderPace(){const pace=$('#pace');if(document.activeElement!==pace)pace.value=String(app.state.pace_ms||0);const detail=$('#banner span');if(app.state.converged&&app.state.pace_ms>0&&detail)detail.textContent+=` · real TCP paced at ${app.state.pace_ms} ms/frame`}
+async function mutate(path,options,done){try{await api(path,options);done?.();await refresh()}catch(e){alert(e.message)}}
+async function refresh(){if(!app.polling)return;try{app.state=await api('/api/state');render()}catch(e){$('#banner').innerHTML=`<strong>Offline</strong><span>${e.message}</span>`}}
+async function sendProbe(source,destination){if(!destination){app.probeStatus={source,ok:false,message:'Select a running destination node'};render();return}try{await api('/api/packets',{method:'POST',body:JSON.stringify({source,destination,priority:0,payload:'mesh-lab probe'})});app.probeStatus={source,ok:true,message:`Probe accepted: ${short(source)} → ${short(destination)}. Follow ORIGINATE / PACKET_SEND below.`};await refresh()}catch(e){app.probeStatus={source,ok:false,message:`Probe failed: ${e.message}`};render()}}
+async function createLink(source,destination,cost){if(!destination||cost<1||cost>65535){alert('Select a destination and enter a cost between 1 and 65535');return}await mutate('/api/links',{method:'POST',body:JSON.stringify({a:source,b:destination,cost})})}
+$('#add-node').onclick=()=>{const selected=app.selection?.type==='node'?node(app.selection.id):null;mutate('/api/nodes',{method:'POST',body:JSON.stringify({attach_to:selected?.running?selected.id:null})})};$('#refresh').onclick=refresh;$('#inject').onclick=()=>{const type=$('#fault').value;if(type==='crash'&&app.selection?.type==='node')mutate(`/api/nodes/${app.selection.id}/crash`,{method:'POST'});if(type==='partition'&&app.selection?.type==='link')mutate(`/api/links/${app.selection.id}/toggle`,{method:'POST'});if(type==='degrade'&&app.selection?.type==='link')mutate(`/api/links/${app.selection.id}/conditions`,{method:'PATCH',body:JSON.stringify({latency_ms:280,loss_percent:35,bandwidth_kbps:60})})};
+$('#pace').onchange=e=>mutate('/api/settings/pace',{method:'PATCH',body:JSON.stringify({pace_ms:+e.target.value})});
+$('#inspector').addEventListener('focusin',e=>{if(e.target.matches('input,select'))app.editingLink=true});
+$('#inspector').addEventListener('focusout',()=>setTimeout(()=>{if(!$('#inspector').contains(document.activeElement))app.editingLink=false},0));
+$('#inspector').addEventListener('pointerdown',e=>{if(e.target.matches('input,select'))app.editingLink=true});
+$('#inspector').addEventListener('keydown',e=>{if(e.target.matches('input,select'))app.editingLink=true});
+$('#inspector').addEventListener('click',e=>{if(e.target.matches('button'))app.editingLink=false},true);
+$('#graph').addEventListener('click',()=>app.editingLink=false,true);
+$('#node-list').addEventListener('click',()=>app.editingLink=false,true);
+refresh();setInterval(refresh,150);
+</script>
+</body>
+</html>

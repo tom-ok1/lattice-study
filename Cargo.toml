@@ -6,6 +6,8 @@ members = [
     "crates/mb-transport",
     "crates/mb-runtime",
     "crates/mb-forward",
+    "bins/mblab-node",
+    "bins/mblab",
 ]
 resolver = "2"
 
@@ -17,7 +19,11 @@ rust-version = "1.75"
 [workspace.dependencies]
 bytes = "=1.10.1"
 prost = "=0.12.6"
-tokio = { version = "=1.37.0", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.37.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+axum = "=0.7.9"
+reqwest = { version = "=0.12.24", default-features = false, features = ["json"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
