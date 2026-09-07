@@ -189,12 +189,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mb-pubsub"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "mb-types",
+ "mb-wire",
+ "prost",
+]
+
+[[package]]
 name = "mb-runtime"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "mb-control",
  "mb-forward",
+ "mb-pubsub",
  "mb-transport",
  "mb-types",
  "mb-wire",

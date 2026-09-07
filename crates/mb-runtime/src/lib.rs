@@ -7,15 +7,19 @@ use mb_control::{
     MAX_LSA_ADJACENCIES, MAX_LSA_TTL_SEC,
 };
 use mb_forward::{DropReason, ForwardAction, ForwardEvent, ForwardTimer, Forwarder};
+use mb_pubsub::{
+    DeliveredMessage, DiscoveryIndex, EnvelopeCodec, PubSub, PubSubAction, PubSubDropReason,
+    PubSubEvent, PubSubRejectReason, SubId, TopicKey, TopicPolicies, TopicSelector,
+};
 use mb_transport::{LinkEvent, TcpEndpoint, TransportError};
 use mb_types::{Component, LinkId, MonoTime, NodeId};
 use mb_wire::{
-    proto, Channel, ForwardPacket, ForwardPacketCodec, ForwardPacketError, FrameType, PacketType,
-    Priority, WireFrame, MAX_PAYLOAD_LEN,
+    proto, Channel, ForwardFlags, ForwardHeader, ForwardPacket, ForwardPacketCodec,
+    ForwardPacketError, FrameType, PacketType, Priority, WireFrame, MAX_PAYLOAD_LEN,
 };
 use prost::Message;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -28,6 +32,8 @@ use tokio::time::{Duration, Instant};
 
 const FORWARD_INPUT_CAPACITY: usize = 256;
 const FORWARD_OUTCOME_CAPACITY: usize = 256;
+const PUBSUB_INPUT_CAPACITY: usize = 256;
+const PUBSUB_OUTCOME_CAPACITY: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeqStoreError(String);
@@ -175,12 +181,28 @@ pub enum ForwardOutcome {
     Delivered(ForwardPacket),
     Dropped {
         reason: DropReason,
-        packet: ForwardPacket,
+        priority: Priority,
+        flow_id: u64,
+        source: NodeId,
     },
     Backpressure {
         link: LinkId,
         packet: ForwardPacket,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PubSubOutcome {
+    Delivered {
+        sub_id: SubId,
+        message: DeliveredMessage,
+    },
+    Published {
+        topic: TopicKey,
+        seq: u64,
+    },
+    Rejected(PubSubRejectReason),
+    Dropped(PubSubDropReason),
 }
 
 enum ForwardInput {
@@ -191,10 +213,70 @@ enum ForwardInput {
     },
 }
 
-struct RuntimeChannels {
+struct RuntimeOutputs {
+    forward: mpsc::Sender<ForwardOutcome>,
+    pubsub: mpsc::Sender<PubSubOutcome>,
+}
+
+struct RuntimeCores {
+    forwarder: Forwarder,
+    pubsub: PubSub,
+}
+
+struct RuntimeInbox {
     link_events: mpsc::Receiver<LinkEvent>,
     forward_inputs: mpsc::Receiver<ForwardInput>,
-    forward_outcomes: mpsc::Sender<ForwardOutcome>,
+    pubsub_inputs: mpsc::Receiver<PubSubEvent>,
+    timers: BinaryHeap<Reverse<(u64, u64, RuntimeTimer)>>,
+    started_at: Instant,
+    next_timer_sequence: u64,
+}
+
+impl RuntimeInbox {
+    fn new(
+        link_events: mpsc::Receiver<LinkEvent>,
+        forward_inputs: mpsc::Receiver<ForwardInput>,
+        pubsub_inputs: mpsc::Receiver<PubSubEvent>,
+    ) -> Self {
+        Self {
+            link_events,
+            forward_inputs,
+            pubsub_inputs,
+            timers: BinaryHeap::new(),
+            started_at: Instant::now(),
+            next_timer_sequence: 0,
+        }
+    }
+
+    fn now(&self) -> MonoTime {
+        MonoTime::from_millis(elapsed_millis(self.started_at))
+    }
+
+    fn schedule(&mut self, timer: RuntimeTimer, at: MonoTime) {
+        self.timers
+            .push(Reverse((at.as_millis(), self.next_timer_sequence, timer)));
+        self.next_timer_sequence = self.next_timer_sequence.wrapping_add(1);
+    }
+
+    async fn recv(&mut self) -> Option<RuntimeInput> {
+        if let Some(Reverse((at_ms, _, timer))) = self.timers.peek().copied() {
+            if at_ms <= elapsed_millis(self.started_at) {
+                self.timers.pop();
+                return Some(RuntimeInput::Timer(timer));
+            }
+        }
+
+        let next_timer_at = self.timers.peek().map(|Reverse((at_ms, _, _))| *at_ms);
+        tokio::select! {
+            link_event = self.link_events.recv() => link_event.map(RuntimeInput::Link),
+            forward_input = self.forward_inputs.recv() => forward_input.map(RuntimeInput::Forward),
+            pubsub_input = self.pubsub_inputs.recv() => pubsub_input.map(RuntimeInput::PubSub),
+            _ = wait_for_timer(self.started_at, next_timer_at) => {
+                let Reverse((_, _, timer)) = self.timers.pop()?;
+                Some(RuntimeInput::Timer(timer))
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -301,6 +383,8 @@ pub struct ControlRuntime {
     endpoint: TcpEndpoint,
     forward_inputs: mpsc::Sender<ForwardInput>,
     forward_outcomes: Option<mpsc::Receiver<ForwardOutcome>>,
+    pubsub_inputs: mpsc::Sender<PubSubEvent>,
+    pubsub_outcomes: Option<mpsc::Receiver<PubSubOutcome>>,
     driver: JoinHandle<()>,
 }
 
@@ -310,11 +394,27 @@ impl ControlRuntime {
         endpoint: TcpEndpoint,
         events: mpsc::Receiver<LinkEvent>,
     ) -> Result<Self, RuntimeError> {
-        Self::spawn_with_seq_store(
+        Self::spawn_with_seq_store_and_pubsub(
             config,
             endpoint,
             events,
             Arc::new(MemorySeqStore::default()),
+            Arc::new(TopicPolicies::default()),
+        )
+    }
+
+    pub fn spawn_with_pubsub(
+        config: RuntimeConfig,
+        endpoint: TcpEndpoint,
+        events: mpsc::Receiver<LinkEvent>,
+        policies: Arc<TopicPolicies>,
+    ) -> Result<Self, RuntimeError> {
+        Self::spawn_with_seq_store_and_pubsub(
+            config,
+            endpoint,
+            events,
+            Arc::new(MemorySeqStore::default()),
+            policies,
         )
     }
 
@@ -323,6 +423,22 @@ impl ControlRuntime {
         endpoint: TcpEndpoint,
         events: mpsc::Receiver<LinkEvent>,
         seq_store: Arc<dyn SeqStore>,
+    ) -> Result<Self, RuntimeError> {
+        Self::spawn_with_seq_store_and_pubsub(
+            config,
+            endpoint,
+            events,
+            seq_store,
+            Arc::new(TopicPolicies::default()),
+        )
+    }
+
+    pub fn spawn_with_seq_store_and_pubsub(
+        config: RuntimeConfig,
+        endpoint: TcpEndpoint,
+        events: mpsc::Receiver<LinkEvent>,
+        seq_store: Arc<dyn SeqStore>,
+        policies: Arc<TopicPolicies>,
     ) -> Result<Self, RuntimeError> {
         if endpoint.local_node() != config.node_id {
             return Err(RuntimeError::EndpointNodeMismatch {
@@ -339,31 +455,77 @@ impl ControlRuntime {
             ControlPlane::new_unsecured_with_seq(config.node_id, config.epoch, persisted_seq);
         let (forward_input_tx, forward_input_rx) = mpsc::channel(FORWARD_INPUT_CAPACITY);
         let (forward_outcome_tx, forward_outcome_rx) = mpsc::channel(FORWARD_OUTCOME_CAPACITY);
+        let (pubsub_input_tx, pubsub_input_rx) = mpsc::channel(PUBSUB_INPUT_CAPACITY);
+        let (pubsub_outcome_tx, pubsub_outcome_rx) = mpsc::channel(PUBSUB_OUTCOME_CAPACITY);
         let driver_endpoint = endpoint.clone();
-        let channels = RuntimeChannels {
-            link_events: events,
-            forward_inputs: forward_input_rx,
-            forward_outcomes: forward_outcome_tx,
-        };
+        let inbox = RuntimeInbox::new(events, forward_input_rx, pubsub_input_rx);
         let driver = tokio::spawn(run_runtime_loop(
             config,
             plane,
+            policies,
             driver_endpoint,
-            channels,
+            inbox,
+            RuntimeOutputs {
+                forward: forward_outcome_tx,
+                pubsub: pubsub_outcome_tx,
+            },
             seq_store,
         ));
         Ok(Self {
             endpoint,
             forward_inputs: forward_input_tx,
             forward_outcomes: Some(forward_outcome_rx),
+            pubsub_inputs: pubsub_input_tx,
+            pubsub_outcomes: Some(pubsub_outcome_rx),
             driver,
         })
     }
 
-    /// Transfers the reliable, single-consumer application egress to the
-    /// caller. Pub/Sub or another upper layer should drain this receiver.
+    /// Transfers the single-consumer application egress to the caller.
+    /// Delivered packets and backpressure returns are reliable; drop reports
+    /// are lightweight and best-effort so congestion cannot stall the runtime.
     pub fn take_forward_outcomes(&mut self) -> Option<mpsc::Receiver<ForwardOutcome>> {
         self.forward_outcomes.take()
+    }
+
+    /// Transfers the reliable, single-consumer Pub/Sub application egress.
+    pub fn take_pubsub_outcomes(&mut self) -> Option<mpsc::Receiver<PubSubOutcome>> {
+        self.pubsub_outcomes.take()
+    }
+
+    pub async fn publish(&self, topic: TopicKey, payload: Bytes) -> Result<(), RuntimeError> {
+        self.pubsub_inputs
+            .send(PubSubEvent::LocalPublish { topic, payload })
+            .await
+            .map_err(|_| RuntimeError::RuntimeStopped)
+    }
+
+    pub async fn subscribe(
+        &self,
+        sub_id: SubId,
+        selector: TopicSelector,
+    ) -> Result<(), RuntimeError> {
+        self.pubsub_inputs
+            .send(PubSubEvent::LocalSubscribe { sub_id, selector })
+            .await
+            .map_err(|_| RuntimeError::RuntimeStopped)
+    }
+
+    pub async fn unsubscribe(&self, sub_id: SubId) -> Result<(), RuntimeError> {
+        self.pubsub_inputs
+            .send(PubSubEvent::LocalUnsubscribe(sub_id))
+            .await
+            .map_err(|_| RuntimeError::RuntimeStopped)
+    }
+
+    pub async fn update_pubsub_discovery(
+        &self,
+        discovery: Arc<DiscoveryIndex>,
+    ) -> Result<(), RuntimeError> {
+        self.pubsub_inputs
+            .send(PubSubEvent::DiscoveryUpdated(discovery))
+            .await
+            .map_err(|_| RuntimeError::RuntimeStopped)
     }
 
     pub async fn send(&self, packet: ForwardPacket) -> Result<(), RuntimeError> {
@@ -403,48 +565,38 @@ impl ControlRuntime {
 async fn run_runtime_loop(
     config: RuntimeConfig,
     mut plane: ControlPlane,
+    pubsub_policies: Arc<TopicPolicies>,
     endpoint: TcpEndpoint,
-    channels: RuntimeChannels,
+    mut inbox: RuntimeInbox,
+    outputs: RuntimeOutputs,
     seq_store: Arc<dyn SeqStore>,
 ) {
-    let RuntimeChannels {
-        link_events,
-        forward_inputs,
-        forward_outcomes,
-    } = channels;
-    let mut events = link_events;
-    let mut forward_inputs = forward_inputs;
-    let started_at = Instant::now();
-    let mut forwarder = Forwarder::new(config.node_id, plane.route_table());
-    let mut timers = BinaryHeap::<Reverse<(u64, u64, RuntimeTimer)>>::new();
-    let mut next_timer_sequence = 0_u64;
+    let mut cores = RuntimeCores {
+        forwarder: Forwarder::new(config.node_id, plane.route_table()),
+        pubsub: PubSub::new(config.node_id, pubsub_policies),
+    };
 
-    loop {
-        let Some(input) =
-            next_runtime_input(started_at, &mut events, &mut forward_inputs, &mut timers).await
-        else {
-            break;
-        };
-
-        let now = MonoTime::from_millis(elapsed_millis(started_at));
+    while let Some(input) = inbox.recv().await {
+        let now = inbox.now();
         let mut control_event = None;
         let mut forward_actions = Vec::new();
+        let mut pubsub_actions = Vec::new();
 
         match input {
             RuntimeInput::Timer(RuntimeTimer::Control(timer)) => {
                 control_event = Some(ControlEvent::Timer(timer));
             }
             RuntimeInput::Timer(RuntimeTimer::Forward(timer)) => {
-                forward_actions.extend(forwarder.handle(now, ForwardEvent::Timer(timer)));
+                forward_actions.extend(cores.forwarder.handle(now, ForwardEvent::Timer(timer)));
             }
             RuntimeInput::Forward(ForwardInput::Outbound(packet)) => {
-                forward_actions.extend(forwarder.handle(now, ForwardEvent::Outbound(packet)));
+                forward_actions.extend(cores.forwarder.handle(now, ForwardEvent::Outbound(packet)));
             }
             RuntimeInput::Forward(ForwardInput::OutboundMulticast {
                 destinations,
                 packet,
             }) => {
-                forward_actions.extend(forwarder.handle(
+                forward_actions.extend(cores.forwarder.handle(
                     now,
                     ForwardEvent::OutboundMulticast {
                         destinations,
@@ -452,30 +604,40 @@ async fn run_runtime_loop(
                     },
                 ));
             }
+            RuntimeInput::PubSub(event) => {
+                pubsub_actions.extend(cores.pubsub.handle(now, event));
+            }
             RuntimeInput::Link(LinkEvent::Up { link, peer }) => {
                 let Some(cost) = config.peer_costs.get(&peer).copied() else {
                     let _ = endpoint.close(link).await;
                     continue;
                 };
-                forward_actions.extend(forwarder.handle(
+                forward_actions.extend(cores.forwarder.handle(
                     now,
                     ForwardEvent::LinkCredit {
                         link,
                         bytes: MAX_PAYLOAD_LEN,
                     },
                 ));
-                forward_actions.extend(forwarder.handle(now, ForwardEvent::LinkWritable(link)));
+                forward_actions.extend(
+                    cores
+                        .forwarder
+                        .handle(now, ForwardEvent::LinkWritable(link)),
+                );
                 control_event = Some(ControlEvent::LinkUp { link, peer, cost });
             }
             RuntimeInput::Link(LinkEvent::Down { link }) => {
-                forward_actions.extend(forwarder.handle(now, ForwardEvent::LinkDown(link)));
+                forward_actions.extend(cores.forwarder.handle(now, ForwardEvent::LinkDown(link)));
                 control_event = Some(ControlEvent::LinkDown { link });
             }
             RuntimeInput::Link(LinkEvent::Frame { link, frame }) => {
                 if frame.frame_type == FrameType::Forward {
                     match decode_forward_frame(frame) {
-                        Ok(packet) => forward_actions
-                            .extend(forwarder.handle(now, ForwardEvent::Inbound { link, packet })),
+                        Ok(packet) => forward_actions.extend(
+                            cores
+                                .forwarder
+                                .handle(now, ForwardEvent::Inbound { link, packet }),
+                        ),
                         Err(_) => {
                             let _ = endpoint.close(link).await;
                             continue;
@@ -500,14 +662,18 @@ async fn run_runtime_loop(
                 ..
             }) => {
                 if frame_type == FrameType::Forward {
-                    forward_actions.extend(forwarder.handle(
+                    forward_actions.extend(cores.forwarder.handle(
                         now,
                         ForwardEvent::LinkCredit {
                             link,
                             bytes: payload_bytes,
                         },
                     ));
-                    forward_actions.extend(forwarder.handle(now, ForwardEvent::LinkWritable(link)));
+                    forward_actions.extend(
+                        cores
+                            .forwarder
+                            .handle(now, ForwardEvent::LinkWritable(link)),
+                    );
                 }
             }
         }
@@ -524,16 +690,14 @@ async fn run_runtime_loop(
                         }
                     }
                     ControlAction::SetTimer { timer, at } => {
-                        timers.push(Reverse((
-                            at.as_millis(),
-                            next_timer_sequence,
-                            RuntimeTimer::Control(timer),
-                        )));
-                        next_timer_sequence = next_timer_sequence.wrapping_add(1);
+                        inbox.schedule(RuntimeTimer::Control(timer), at);
                     }
                     ControlAction::PublishRoutes(routes) => {
-                        forward_actions
-                            .extend(forwarder.handle(now, ForwardEvent::RoutesUpdated(routes)));
+                        forward_actions.extend(
+                            cores
+                                .forwarder
+                                .handle(now, ForwardEvent::RoutesUpdated(routes)),
+                        );
                     }
                     ControlAction::PersistSeq(seq) => {
                         let store = Arc::clone(&seq_store);
@@ -546,11 +710,17 @@ async fn run_runtime_loop(
             }
         }
 
+        forward_actions.extend(
+            execute_pubsub_actions(&mut cores.forwarder, &outputs.pubsub, now, pubsub_actions)
+                .await,
+        );
+
         execute_forward_actions(
             &endpoint,
-            &forward_outcomes,
-            &mut timers,
-            &mut next_timer_sequence,
+            &outputs,
+            &mut inbox,
+            &mut cores,
+            now,
             forward_actions,
         )
         .await;
@@ -566,31 +736,8 @@ enum RuntimeTimer {
 enum RuntimeInput {
     Link(LinkEvent),
     Forward(ForwardInput),
+    PubSub(PubSubEvent),
     Timer(RuntimeTimer),
-}
-
-async fn next_runtime_input(
-    started_at: Instant,
-    events: &mut mpsc::Receiver<LinkEvent>,
-    forward_inputs: &mut mpsc::Receiver<ForwardInput>,
-    timers: &mut BinaryHeap<Reverse<(u64, u64, RuntimeTimer)>>,
-) -> Option<RuntimeInput> {
-    if let Some(Reverse((at_ms, _, timer))) = timers.peek().copied() {
-        if at_ms <= elapsed_millis(started_at) {
-            timers.pop();
-            return Some(RuntimeInput::Timer(timer));
-        }
-    }
-
-    let next_timer_at = timers.peek().map(|Reverse((at_ms, _, _))| *at_ms);
-    tokio::select! {
-        link_event = events.recv() => link_event.map(RuntimeInput::Link),
-        forward_input = forward_inputs.recv() => forward_input.map(RuntimeInput::Forward),
-        _ = wait_for_timer(started_at, next_timer_at) => {
-            let Reverse((_, _, timer)) = timers.pop()?;
-            Some(RuntimeInput::Timer(timer))
-        }
-    }
 }
 
 async fn wait_for_timer(started_at: Instant, at_ms: Option<u64>) {
@@ -608,12 +755,14 @@ fn elapsed_millis(started_at: Instant) -> u64 {
 
 async fn execute_forward_actions(
     endpoint: &TcpEndpoint,
-    outcomes: &mpsc::Sender<ForwardOutcome>,
-    timers: &mut BinaryHeap<Reverse<(u64, u64, RuntimeTimer)>>,
-    next_timer_sequence: &mut u64,
+    outputs: &RuntimeOutputs,
+    inbox: &mut RuntimeInbox,
+    cores: &mut RuntimeCores,
+    now: MonoTime,
     actions: Vec<ForwardAction>,
 ) {
-    for action in actions {
+    let mut pending = VecDeque::from(actions);
+    while let Some(action) = pending.pop_front() {
         match action {
             ForwardAction::Send { link, packet } => {
                 let Ok(payload) = ForwardPacketCodec::encode(&packet) else {
@@ -629,28 +778,122 @@ async fn execute_forward_actions(
                 }
             }
             ForwardAction::DeliverLocal(packet) => {
-                let _ = outcomes.send(ForwardOutcome::Delivered(packet)).await;
+                if EnvelopeCodec::is_envelope(&packet.payload) {
+                    let pubsub_actions = cores.pubsub.handle(
+                        now,
+                        PubSubEvent::Inbound {
+                            source: packet.header.source,
+                            payload: packet.payload,
+                        },
+                    );
+                    pending.extend(
+                        execute_pubsub_actions(
+                            &mut cores.forwarder,
+                            &outputs.pubsub,
+                            now,
+                            pubsub_actions,
+                        )
+                        .await,
+                    );
+                } else {
+                    let _ = outputs
+                        .forward
+                        .send(ForwardOutcome::Delivered(packet))
+                        .await;
+                }
             }
             ForwardAction::Drop { reason, packet } => {
-                let _ = outcomes
-                    .send(ForwardOutcome::Dropped { reason, packet })
-                    .await;
+                report_drop(&outputs.forward, reason, packet);
             }
             ForwardAction::Backpressure { link, packet } => {
-                let _ = outcomes
+                let _ = outputs
+                    .forward
                     .send(ForwardOutcome::Backpressure { link, packet })
                     .await;
             }
             ForwardAction::SetTimer { timer, at } => {
-                timers.push(Reverse((
-                    at.as_millis(),
-                    *next_timer_sequence,
-                    RuntimeTimer::Forward(timer),
-                )));
-                *next_timer_sequence = next_timer_sequence.wrapping_add(1);
+                inbox.schedule(RuntimeTimer::Forward(timer), at);
             }
         }
     }
+}
+
+async fn execute_pubsub_actions(
+    forwarder: &mut Forwarder,
+    outcomes: &mpsc::Sender<PubSubOutcome>,
+    now: MonoTime,
+    actions: Vec<PubSubAction>,
+) -> Vec<ForwardAction> {
+    let mut forward_actions = Vec::new();
+    for action in actions {
+        match action {
+            PubSubAction::SendMulticast {
+                destinations,
+                priority,
+                flow_id,
+                conflate_key,
+                conflatable,
+                payload,
+            } => {
+                let flags = if conflatable {
+                    ForwardFlags::from_bits(ForwardFlags::CONFLATABLE)
+                        .expect("the conflatable flag is supported")
+                } else {
+                    ForwardFlags::empty()
+                };
+                let packet = ForwardPacket {
+                    header: ForwardHeader {
+                        packet_type: PacketType::Multicast,
+                        priority,
+                        ttl: 32,
+                        flags,
+                        destination: NodeId::default(),
+                        source: forwarder.node_id(),
+                        flow_id,
+                        conflate_key,
+                    },
+                    multicast_destinations: Vec::new(),
+                    payload,
+                };
+                forward_actions.extend(forwarder.handle(
+                    now,
+                    ForwardEvent::OutboundMulticast {
+                        destinations,
+                        packet,
+                    },
+                ));
+            }
+            PubSubAction::DeliverToApp { sub_id, message } => {
+                let _ = outcomes
+                    .send(PubSubOutcome::Delivered { sub_id, message })
+                    .await;
+            }
+            PubSubAction::Published { topic, seq } => {
+                let _ = outcomes.send(PubSubOutcome::Published { topic, seq }).await;
+            }
+            PubSubAction::Rejected(reason) => {
+                let _ = outcomes.send(PubSubOutcome::Rejected(reason)).await;
+            }
+            PubSubAction::Dropped(reason) => {
+                let _ = outcomes.try_send(PubSubOutcome::Dropped(reason));
+            }
+        }
+    }
+    forward_actions
+}
+
+fn report_drop(outcomes: &mpsc::Sender<ForwardOutcome>, reason: DropReason, packet: ForwardPacket) {
+    let priority = packet.header.priority;
+    let flow_id = packet.header.flow_id;
+    let source = packet.header.source;
+    drop(packet);
+
+    let _ = outcomes.try_send(ForwardOutcome::Dropped {
+        reason,
+        priority,
+        flow_id,
+        source,
+    });
 }
 
 fn channel_for_priority(priority: Priority) -> Channel {
@@ -868,6 +1111,76 @@ mod tests {
         let mut bytes = [0; 32];
         bytes[31] = value;
         NodeId::from_bytes(bytes)
+    }
+
+    fn forward_packet(priority: Priority, payload: Bytes) -> ForwardPacket {
+        ForwardPacket {
+            header: mb_wire::ForwardHeader {
+                packet_type: PacketType::Unicast,
+                priority,
+                ttl: 32,
+                flags: mb_wire::ForwardFlags::empty(),
+                destination: node(2),
+                source: node(1),
+                flow_id: 42,
+                conflate_key: 0,
+            },
+            multicast_destinations: Vec::new(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn drop_report_contains_only_packet_identity() {
+        let (outcomes, mut receiver) = mpsc::channel(1);
+        let payload = Bytes::from(vec![7; 1_024]);
+        let retained = payload.clone();
+
+        report_drop(
+            &outcomes,
+            DropReason::LinkDown,
+            forward_packet(Priority::P3, payload),
+        );
+
+        assert_eq!(
+            receiver.try_recv().expect("drop report must be emitted"),
+            ForwardOutcome::Dropped {
+                reason: DropReason::LinkDown,
+                priority: Priority::P3,
+                flow_id: 42,
+                source: node(1),
+            }
+        );
+        assert!(
+            retained.try_into_mut().is_ok(),
+            "the dropped packet payload must not be retained by the outcome"
+        );
+    }
+
+    #[test]
+    fn drop_report_is_discarded_when_the_outcome_channel_is_full() {
+        let (outcomes, mut receiver) = mpsc::channel(1);
+        outcomes
+            .try_send(ForwardOutcome::Delivered(forward_packet(
+                Priority::P0,
+                Bytes::new(),
+            )))
+            .expect("channel must have room for the first outcome");
+
+        report_drop(
+            &outcomes,
+            DropReason::QueueFull(Priority::P3),
+            forward_packet(Priority::P3, Bytes::from_static(b"discarded")),
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ForwardOutcome::Delivered(_))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

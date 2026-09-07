@@ -87,9 +87,10 @@ P3 が滞留していても P0 が次の送信機会を先に得ることを決�
 
 **目標**：Topic への publish が、多段ホップ越しに購読者へ届く。
 
-- [ ] `mb-pubsub`：Envelope、Topic ポリシー、購読管理
-- [ ] Explicit Multicast による配信（Phase 2 と接続）
-- [ ] dedup（last_seq + 64 bit ビットマップ）
+- [x] `mb-pubsub`：最小 Envelope、Topic ポリシー、ローカル購読管理
+- [x] 注入式 `DiscoveryIndex` と Explicit Multicast による live 配信（Phase 2 と接続）
+- [x] dedup（last_seq + 64 bit ビットマップ）
+- [ ] LSA の `TopicAd` による購読者 discovery
 - [ ] アプリ向け gRPC API（Publish / Subscribe）
 - [ ] `mbtool topics` / `mbtool watch` / `mbtool publish`
 - [ ] シミュレーションの不変条件 I5 を追加
