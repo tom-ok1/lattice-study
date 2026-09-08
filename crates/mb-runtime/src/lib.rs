@@ -3,21 +3,26 @@
 use bytes::Bytes;
 use mb_control::{
     Adjacency, ControlAction, ControlEvent, ControlFrame, ControlPlane, ControlTimer, DigestEntry,
-    InvalidLinkCost, LinkCost, Lsa, LsaMessage, RouteTable, MAX_DIGEST_ENTRIES,
-    MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSA_TTL_SEC,
+    DiscoveredTopicAd, InvalidLinkCost, LinkCost, Lsa, LsaMessage, RouteTable, TopicAd, TopicRoles,
+    MAX_DIGEST_ENTRIES, MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSA_TOPIC_ADS,
+    MAX_LSA_TTL_SEC, MAX_TOPIC_NAME_LEN, MAX_TOPIC_PARTITION_LEN,
 };
 use mb_forward::{
     DropReason, ForwardAction, ForwardEvent, ForwardTimer, Forwarder, LinkQueueSnapshot,
 };
+use mb_pubsub::{
+    DeliveredMessage, DiscoveryIndex, EnvelopeCodec, PubSub, PubSubAction, PubSubDropReason,
+    PubSubEvent, PubSubRejectReason, SubId, TopicKey, TopicPolicies, TopicSelector,
+};
 use mb_transport::{LinkEvent, TcpEndpoint, TransportError};
 use mb_types::{Component, LinkId, MonoTime, NodeId};
 use mb_wire::{
-    proto, Channel, ForwardPacket, ForwardPacketCodec, ForwardPacketError, FrameType, PacketType,
-    Priority, WireFrame, MAX_PAYLOAD_LEN,
+    proto, Channel, ForwardFlags, ForwardHeader, ForwardPacket, ForwardPacketCodec,
+    ForwardPacketError, FrameType, PacketType, Priority, WireFrame, MAX_PAYLOAD_LEN,
 };
 use prost::Message;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -31,6 +36,8 @@ use tokio::time::{Duration, Instant};
 
 const FORWARD_INPUT_CAPACITY: usize = 256;
 const FORWARD_OUTCOME_CAPACITY: usize = 256;
+const PUBSUB_INPUT_CAPACITY: usize = 256;
+const PUBSUB_OUTCOME_CAPACITY: usize = 256;
 const RECENT_EVENT_LIMIT: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,6 +230,20 @@ pub enum ForwardOutcome {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PubSubOutcome {
+    Delivered {
+        sub_id: SubId,
+        message: DeliveredMessage,
+    },
+    Published {
+        topic: TopicKey,
+        seq: u64,
+    },
+    Rejected(PubSubRejectReason),
+    Dropped(PubSubDropReason),
+}
+
 enum ForwardInput {
     Outbound(ForwardPacket),
     OutboundMulticast {
@@ -231,9 +252,20 @@ enum ForwardInput {
     },
 }
 
+struct RuntimeOutputs {
+    forward: mpsc::Sender<ForwardOutcome>,
+    pubsub: mpsc::Sender<PubSubOutcome>,
+}
+
+struct RuntimeCores {
+    forwarder: Forwarder,
+    pubsub: PubSub,
+}
+
 struct RuntimeInbox {
     link_events: mpsc::Receiver<LinkEvent>,
     forward_inputs: mpsc::Receiver<ForwardInput>,
+    pubsub_inputs: mpsc::Receiver<PubSubEvent>,
     timers: BinaryHeap<Reverse<(u64, u64, RuntimeTimer)>>,
     started_at: Instant,
     next_timer_sequence: u64,
@@ -243,10 +275,12 @@ impl RuntimeInbox {
     fn new(
         link_events: mpsc::Receiver<LinkEvent>,
         forward_inputs: mpsc::Receiver<ForwardInput>,
+        pubsub_inputs: mpsc::Receiver<PubSubEvent>,
     ) -> Self {
         Self {
             link_events,
             forward_inputs,
+            pubsub_inputs,
             timers: BinaryHeap::new(),
             started_at: Instant::now(),
             next_timer_sequence: 0,
@@ -275,20 +309,13 @@ impl RuntimeInbox {
         tokio::select! {
             link_event = self.link_events.recv() => link_event.map(RuntimeInput::Link),
             forward_input = self.forward_inputs.recv() => forward_input.map(RuntimeInput::Forward),
+            pubsub_input = self.pubsub_inputs.recv() => pubsub_input.map(RuntimeInput::PubSub),
             _ = wait_for_timer(self.started_at, next_timer_at) => {
                 let Reverse((_, _, timer)) = self.timers.pop()?;
                 Some(RuntimeInput::Timer(timer))
             }
         }
     }
-}
-
-struct RuntimeServices {
-    forward_outcomes: mpsc::Sender<ForwardOutcome>,
-    seq_store: Arc<dyn SeqStore>,
-    peer_costs: Arc<RwLock<BTreeMap<NodeId, LinkCost>>>,
-    snapshots: watch::Sender<RuntimeSnapshot>,
-    diagnostics_enabled: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -305,6 +332,11 @@ pub enum RuntimeError {
     InvalidNodeIdLength(usize),
     InvalidLinkCost(u32),
     InvalidLsaTtl(u32),
+    InvalidTopicName,
+    InvalidTopicRole(u32),
+    TopicNameTooLong(usize),
+    TopicPartitionTooLong(usize),
+    DuplicateTopicAd,
     TooManyElements {
         field: &'static str,
         count: usize,
@@ -340,6 +372,19 @@ impl fmt::Display for RuntimeError {
             }
             Self::InvalidLinkCost(cost) => write!(f, "invalid link cost {cost}"),
             Self::InvalidLsaTtl(ttl) => write!(f, "invalid LSA ttl_sec {ttl}"),
+            Self::InvalidTopicName => f.write_str("LSA topic name must not be empty"),
+            Self::InvalidTopicRole(role) => write!(f, "invalid LSA topic role bits {role:#x}"),
+            Self::TopicNameTooLong(length) => write!(
+                f,
+                "LSA topic name length {length} exceeds the {MAX_TOPIC_NAME_LEN} byte limit"
+            ),
+            Self::TopicPartitionTooLong(length) => write!(
+                f,
+                "LSA topic partition length {length} exceeds the {MAX_TOPIC_PARTITION_LEN} byte limit"
+            ),
+            Self::DuplicateTopicAd => {
+                f.write_str("LSA contains duplicate topic and partition advertisements")
+            }
             Self::TooManyElements {
                 field,
                 count,
@@ -396,6 +441,8 @@ pub struct ControlRuntime {
     peer_costs: Arc<RwLock<BTreeMap<NodeId, LinkCost>>>,
     forward_inputs: mpsc::Sender<ForwardInput>,
     forward_outcomes: Option<mpsc::Receiver<ForwardOutcome>>,
+    pubsub_inputs: mpsc::Sender<PubSubEvent>,
+    pubsub_outcomes: Option<mpsc::Receiver<PubSubOutcome>>,
     snapshots: watch::Receiver<RuntimeSnapshot>,
     diagnostics_enabled: Arc<AtomicBool>,
     driver: JoinHandle<()>,
@@ -407,11 +454,27 @@ impl ControlRuntime {
         endpoint: TcpEndpoint,
         events: mpsc::Receiver<LinkEvent>,
     ) -> Result<Self, RuntimeError> {
-        Self::spawn_with_seq_store(
+        Self::spawn_with_seq_store_and_pubsub(
             config,
             endpoint,
             events,
             Arc::new(MemorySeqStore::default()),
+            Arc::new(TopicPolicies::default()),
+        )
+    }
+
+    pub fn spawn_with_pubsub(
+        config: RuntimeConfig,
+        endpoint: TcpEndpoint,
+        events: mpsc::Receiver<LinkEvent>,
+        policies: Arc<TopicPolicies>,
+    ) -> Result<Self, RuntimeError> {
+        Self::spawn_with_seq_store_and_pubsub(
+            config,
+            endpoint,
+            events,
+            Arc::new(MemorySeqStore::default()),
+            policies,
         )
     }
 
@@ -420,6 +483,22 @@ impl ControlRuntime {
         endpoint: TcpEndpoint,
         events: mpsc::Receiver<LinkEvent>,
         seq_store: Arc<dyn SeqStore>,
+    ) -> Result<Self, RuntimeError> {
+        Self::spawn_with_seq_store_and_pubsub(
+            config,
+            endpoint,
+            events,
+            seq_store,
+            Arc::new(TopicPolicies::default()),
+        )
+    }
+
+    pub fn spawn_with_seq_store_and_pubsub(
+        config: RuntimeConfig,
+        endpoint: TcpEndpoint,
+        events: mpsc::Receiver<LinkEvent>,
+        seq_store: Arc<dyn SeqStore>,
+        policies: Arc<TopicPolicies>,
     ) -> Result<Self, RuntimeError> {
         if endpoint.local_node() != config.node_id {
             return Err(RuntimeError::EndpointNodeMismatch {
@@ -437,30 +516,35 @@ impl ControlRuntime {
         let peer_costs = Arc::new(RwLock::new(config.peer_costs.clone()));
         let (forward_input_tx, forward_input_rx) = mpsc::channel(FORWARD_INPUT_CAPACITY);
         let (forward_outcome_tx, forward_outcome_rx) = mpsc::channel(FORWARD_OUTCOME_CAPACITY);
+        let (pubsub_input_tx, pubsub_input_rx) = mpsc::channel(PUBSUB_INPUT_CAPACITY);
+        let (pubsub_outcome_tx, pubsub_outcome_rx) = mpsc::channel(PUBSUB_OUTCOME_CAPACITY);
         let (snapshot_tx, snapshot_rx) =
             watch::channel(RuntimeSnapshot::empty(config.node_id, plane.route_table()));
         let diagnostics_enabled = Arc::new(AtomicBool::new(false));
         let driver_endpoint = endpoint.clone();
-        let inbox = RuntimeInbox::new(events, forward_input_rx);
-        let services = RuntimeServices {
-            forward_outcomes: forward_outcome_tx,
-            seq_store,
-            peer_costs: Arc::clone(&peer_costs),
-            snapshots: snapshot_tx,
-            diagnostics_enabled: Arc::clone(&diagnostics_enabled),
-        };
+        let inbox = RuntimeInbox::new(events, forward_input_rx, pubsub_input_rx);
         let driver = tokio::spawn(run_runtime_loop(
             config,
             plane,
+            policies,
             driver_endpoint,
             inbox,
-            services,
+            RuntimeOutputs {
+                forward: forward_outcome_tx,
+                pubsub: pubsub_outcome_tx,
+            },
+            seq_store,
+            Arc::clone(&peer_costs),
+            snapshot_tx,
+            Arc::clone(&diagnostics_enabled),
         ));
         Ok(Self {
             endpoint,
             peer_costs,
             forward_inputs: forward_input_tx,
             forward_outcomes: Some(forward_outcome_rx),
+            pubsub_inputs: pubsub_input_tx,
+            pubsub_outcomes: Some(pubsub_outcome_rx),
             snapshots: snapshot_rx,
             diagnostics_enabled,
             driver,
@@ -472,6 +556,11 @@ impl ControlRuntime {
     /// are lightweight and best-effort so congestion cannot stall the runtime.
     pub fn take_forward_outcomes(&mut self) -> Option<mpsc::Receiver<ForwardOutcome>> {
         self.forward_outcomes.take()
+    }
+
+    /// Transfers the reliable, single-consumer Pub/Sub application egress.
+    pub fn take_pubsub_outcomes(&mut self) -> Option<mpsc::Receiver<PubSubOutcome>> {
+        self.pubsub_outcomes.take()
     }
 
     /// Returns the latest diagnostic snapshot. Call `enable_diagnostics`
@@ -486,8 +575,6 @@ impl ControlRuntime {
     }
 
     /// Enables the bounded diagnostic event log and full runtime snapshots.
-    /// Production callers that do not opt in avoid formatting and cloning
-    /// diagnostic state on the forwarding hot path.
     pub fn enable_diagnostics(&self) {
         self.diagnostics_enabled.store(true, Ordering::Relaxed);
     }
@@ -509,6 +596,31 @@ impl ControlRuntime {
 
     pub async fn close_link(&self, link: LinkId) -> Result<(), RuntimeError> {
         Ok(self.endpoint.close(link).await?)
+    }
+
+    pub async fn publish(&self, topic: TopicKey, payload: Bytes) -> Result<(), RuntimeError> {
+        self.pubsub_inputs
+            .send(PubSubEvent::LocalPublish { topic, payload })
+            .await
+            .map_err(|_| RuntimeError::RuntimeStopped)
+    }
+
+    pub async fn subscribe(
+        &self,
+        sub_id: SubId,
+        selector: TopicSelector,
+    ) -> Result<(), RuntimeError> {
+        self.pubsub_inputs
+            .send(PubSubEvent::LocalSubscribe { sub_id, selector })
+            .await
+            .map_err(|_| RuntimeError::RuntimeStopped)
+    }
+
+    pub async fn unsubscribe(&self, sub_id: SubId) -> Result<(), RuntimeError> {
+        self.pubsub_inputs
+            .send(PubSubEvent::LocalUnsubscribe(sub_id))
+            .await
+            .map_err(|_| RuntimeError::RuntimeStopped)
     }
 
     pub async fn send(&self, packet: ForwardPacket) -> Result<(), RuntimeError> {
@@ -548,18 +660,19 @@ impl ControlRuntime {
 async fn run_runtime_loop(
     config: RuntimeConfig,
     mut plane: ControlPlane,
+    pubsub_policies: Arc<TopicPolicies>,
     endpoint: TcpEndpoint,
     mut inbox: RuntimeInbox,
-    services: RuntimeServices,
+    outputs: RuntimeOutputs,
+    seq_store: Arc<dyn SeqStore>,
+    peer_costs: Arc<RwLock<BTreeMap<NodeId, LinkCost>>>,
+    snapshots: watch::Sender<RuntimeSnapshot>,
+    diagnostics_enabled: Arc<AtomicBool>,
 ) {
-    let RuntimeServices {
-        forward_outcomes,
-        seq_store,
-        peer_costs,
-        snapshots,
-        diagnostics_enabled,
-    } = services;
-    let mut forwarder = Forwarder::new(config.node_id, plane.route_table());
+    let mut cores = RuntimeCores {
+        forwarder: Forwarder::new(config.node_id, plane.route_table()),
+        pubsub: PubSub::new(config.node_id, pubsub_policies),
+    };
     let mut peers = BTreeMap::<LinkId, NodeId>::new();
     let mut recent_events = VecDeque::<RuntimeEvent>::new();
     let mut next_event_sequence = 0_u64;
@@ -569,13 +682,14 @@ async fn run_runtime_loop(
         let diagnostics_enabled = diagnostics_enabled.load(Ordering::Relaxed);
         let mut control_event = None;
         let mut forward_actions = Vec::new();
+        let mut pubsub_actions = Vec::new();
 
         match input {
             RuntimeInput::Timer(RuntimeTimer::Control(timer)) => {
                 control_event = Some(ControlEvent::Timer(timer));
             }
             RuntimeInput::Timer(RuntimeTimer::Forward(timer)) => {
-                forward_actions.extend(forwarder.handle(now, ForwardEvent::Timer(timer)));
+                forward_actions.extend(cores.forwarder.handle(now, ForwardEvent::Timer(timer)));
             }
             RuntimeInput::Forward(ForwardInput::Outbound(packet)) => {
                 if diagnostics_enabled {
@@ -588,7 +702,7 @@ async fn run_runtime_loop(
                         None,
                     );
                 }
-                forward_actions.extend(forwarder.handle(now, ForwardEvent::Outbound(packet)));
+                forward_actions.extend(cores.forwarder.handle(now, ForwardEvent::Outbound(packet)));
             }
             RuntimeInput::Forward(ForwardInput::OutboundMulticast {
                 destinations,
@@ -608,13 +722,16 @@ async fn run_runtime_loop(
                         None,
                     );
                 }
-                forward_actions.extend(forwarder.handle(
+                forward_actions.extend(cores.forwarder.handle(
                     now,
                     ForwardEvent::OutboundMulticast {
                         destinations,
                         packet,
                     },
                 ));
+            }
+            RuntimeInput::PubSub(event) => {
+                pubsub_actions.extend(cores.pubsub.handle(now, event));
             }
             RuntimeInput::Link(LinkEvent::Up { link, peer }) => {
                 let Some(cost) = peer_costs.read().await.get(&peer).copied() else {
@@ -632,14 +749,18 @@ async fn run_runtime_loop(
                         Some(link),
                     );
                 }
-                forward_actions.extend(forwarder.handle(
+                forward_actions.extend(cores.forwarder.handle(
                     now,
                     ForwardEvent::LinkCredit {
                         link,
                         bytes: MAX_PAYLOAD_LEN,
                     },
                 ));
-                forward_actions.extend(forwarder.handle(now, ForwardEvent::LinkWritable(link)));
+                forward_actions.extend(
+                    cores
+                        .forwarder
+                        .handle(now, ForwardEvent::LinkWritable(link)),
+                );
                 control_event = Some(ControlEvent::LinkUp { link, peer, cost });
             }
             RuntimeInput::Link(LinkEvent::Down { link }) => {
@@ -654,14 +775,17 @@ async fn run_runtime_loop(
                         Some(link),
                     );
                 }
-                forward_actions.extend(forwarder.handle(now, ForwardEvent::LinkDown(link)));
+                forward_actions.extend(cores.forwarder.handle(now, ForwardEvent::LinkDown(link)));
                 control_event = Some(ControlEvent::LinkDown { link });
             }
             RuntimeInput::Link(LinkEvent::Frame { link, frame }) => {
                 if frame.frame_type == FrameType::Forward {
                     match decode_forward_frame(frame) {
-                        Ok(packet) => forward_actions
-                            .extend(forwarder.handle(now, ForwardEvent::Inbound { link, packet })),
+                        Ok(packet) => forward_actions.extend(
+                            cores
+                                .forwarder
+                                .handle(now, ForwardEvent::Inbound { link, packet }),
+                        ),
                         Err(_) => {
                             let _ = endpoint.close(link).await;
                             continue;
@@ -686,16 +810,39 @@ async fn run_runtime_loop(
                 ..
             }) => {
                 if frame_type == FrameType::Forward {
-                    forward_actions.extend(forwarder.handle(
+                    forward_actions.extend(cores.forwarder.handle(
                         now,
                         ForwardEvent::LinkCredit {
                             link,
                             bytes: payload_bytes,
                         },
                     ));
-                    forward_actions.extend(forwarder.handle(now, ForwardEvent::LinkWritable(link)));
+                    forward_actions.extend(
+                        cores
+                            .forwarder
+                            .handle(now, ForwardEvent::LinkWritable(link)),
+                    );
                 }
             }
+        }
+
+        if let Some(selectors) = pubsub_actions.iter().find_map(|action| match action {
+            PubSubAction::LocalSubscriptionsChanged(selectors) => Some(selectors),
+            _ => None,
+        }) {
+            let ads = selectors
+                .iter()
+                .map(|selector| TopicAd {
+                    topic: selector.name().to_owned(),
+                    partition: selector
+                        .partition()
+                        .map_or_else(Vec::new, |partition| partition.to_vec()),
+                    roles: TopicRoles::SUBSCRIBE,
+                    head_seq: 0,
+                    tail_seq: 0,
+                })
+                .collect();
+            control_event = Some(ControlEvent::LocalTopicAdsChanged(ads));
         }
 
         if let Some(event) = control_event {
@@ -738,8 +885,19 @@ async fn run_runtime_loop(
                                 None,
                             );
                         }
-                        forward_actions
-                            .extend(forwarder.handle(now, ForwardEvent::RoutesUpdated(routes)));
+                        forward_actions.extend(
+                            cores
+                                .forwarder
+                                .handle(now, ForwardEvent::RoutesUpdated(routes)),
+                        );
+                    }
+                    ControlAction::PublishTopicAds(ads) => {
+                        let discovery = discovery_from_topic_ads(&ads);
+                        pubsub_actions.extend(
+                            cores
+                                .pubsub
+                                .handle(now, PubSubEvent::DiscoveryUpdated(Arc::new(discovery))),
+                        );
                     }
                     ControlAction::PersistSeq(seq) => {
                         let store = Arc::clone(&seq_store);
@@ -751,6 +909,11 @@ async fn run_runtime_loop(
                 }
             }
         }
+
+        forward_actions.extend(
+            execute_pubsub_actions(&mut cores.forwarder, &outputs.pubsub, now, pubsub_actions)
+                .await,
+        );
 
         if diagnostics_enabled {
             for action in &forward_actions {
@@ -786,12 +949,25 @@ async fn run_runtime_loop(
             }
         }
 
-        execute_forward_actions(&endpoint, &forward_outcomes, &mut inbox, forward_actions).await;
+        execute_forward_actions(
+            &endpoint,
+            &outputs,
+            &mut inbox,
+            &mut cores,
+            now,
+            forward_actions,
+        )
+        .await;
 
         if diagnostics_enabled {
             let queues = peers
                 .keys()
-                .filter_map(|link| forwarder.queue_snapshot(*link).map(|queue| (*link, queue)))
+                .filter_map(|link| {
+                    cores
+                        .forwarder
+                        .queue_snapshot(*link)
+                        .map(|queue| (*link, queue))
+                })
                 .collect();
             snapshots.send_replace(RuntimeSnapshot {
                 node_id: config.node_id,
@@ -858,6 +1034,37 @@ fn push_runtime_event(
     *next_sequence = next_sequence.wrapping_add(1);
 }
 
+fn discovery_from_topic_ads(ads: &[DiscoveredTopicAd]) -> DiscoveryIndex {
+    let mut subscribers = BTreeMap::<TopicSelector, BTreeSet<NodeId>>::new();
+    for discovered in ads {
+        if !discovered.ad.roles.contains(TopicRoles::SUBSCRIBE) {
+            continue;
+        }
+        let selector = if discovered.ad.partition.is_empty() {
+            TopicSelector::all_partitions(discovered.ad.topic.clone())
+                .expect("validated LSA topic must remain valid for Pub/Sub")
+        } else {
+            TopicSelector::exact(
+                TopicKey::new(
+                    discovered.ad.topic.clone(),
+                    Bytes::copy_from_slice(&discovered.ad.partition),
+                )
+                .expect("validated LSA topic must remain valid for Pub/Sub"),
+            )
+        };
+        subscribers
+            .entry(selector)
+            .or_default()
+            .insert(discovered.node);
+    }
+
+    let mut discovery = DiscoveryIndex::default();
+    for (selector, nodes) in subscribers {
+        discovery.set_subscribers(selector, nodes);
+    }
+    discovery
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum RuntimeTimer {
     Control(ControlTimer),
@@ -867,6 +1074,7 @@ enum RuntimeTimer {
 enum RuntimeInput {
     Link(LinkEvent),
     Forward(ForwardInput),
+    PubSub(PubSubEvent),
     Timer(RuntimeTimer),
 }
 
@@ -885,11 +1093,14 @@ fn elapsed_millis(started_at: Instant) -> u64 {
 
 async fn execute_forward_actions(
     endpoint: &TcpEndpoint,
-    outcomes: &mpsc::Sender<ForwardOutcome>,
+    outputs: &RuntimeOutputs,
     inbox: &mut RuntimeInbox,
+    cores: &mut RuntimeCores,
+    now: MonoTime,
     actions: Vec<ForwardAction>,
 ) {
-    for action in actions {
+    let mut pending = VecDeque::from(actions);
+    while let Some(action) = pending.pop_front() {
         match action {
             ForwardAction::Send { link, packet } => {
                 let Ok(payload) = ForwardPacketCodec::encode(&packet) else {
@@ -905,13 +1116,36 @@ async fn execute_forward_actions(
                 }
             }
             ForwardAction::DeliverLocal(packet) => {
-                let _ = outcomes.send(ForwardOutcome::Delivered(packet)).await;
+                if EnvelopeCodec::is_envelope(&packet.payload) {
+                    let pubsub_actions = cores.pubsub.handle(
+                        now,
+                        PubSubEvent::Inbound {
+                            source: packet.header.source,
+                            payload: packet.payload,
+                        },
+                    );
+                    pending.extend(
+                        execute_pubsub_actions(
+                            &mut cores.forwarder,
+                            &outputs.pubsub,
+                            now,
+                            pubsub_actions,
+                        )
+                        .await,
+                    );
+                } else {
+                    let _ = outputs
+                        .forward
+                        .send(ForwardOutcome::Delivered(packet))
+                        .await;
+                }
             }
             ForwardAction::Drop { reason, packet } => {
-                report_drop(outcomes, reason, packet);
+                report_drop(&outputs.forward, reason, packet);
             }
             ForwardAction::Backpressure { link, packet } => {
-                let _ = outcomes
+                let _ = outputs
+                    .forward
                     .send(ForwardOutcome::Backpressure { link, packet })
                     .await;
             }
@@ -920,6 +1154,71 @@ async fn execute_forward_actions(
             }
         }
     }
+}
+
+async fn execute_pubsub_actions(
+    forwarder: &mut Forwarder,
+    outcomes: &mpsc::Sender<PubSubOutcome>,
+    now: MonoTime,
+    actions: Vec<PubSubAction>,
+) -> Vec<ForwardAction> {
+    let mut forward_actions = Vec::new();
+    for action in actions {
+        match action {
+            PubSubAction::SendMulticast {
+                destinations,
+                priority,
+                flow_id,
+                conflate_key,
+                conflatable,
+                payload,
+            } => {
+                let flags = if conflatable {
+                    ForwardFlags::from_bits(ForwardFlags::CONFLATABLE)
+                        .expect("the conflatable flag is supported")
+                } else {
+                    ForwardFlags::empty()
+                };
+                let packet = ForwardPacket {
+                    header: ForwardHeader {
+                        packet_type: PacketType::Multicast,
+                        priority,
+                        ttl: 32,
+                        flags,
+                        destination: NodeId::default(),
+                        source: forwarder.node_id(),
+                        flow_id,
+                        conflate_key,
+                    },
+                    multicast_destinations: Vec::new(),
+                    payload,
+                };
+                forward_actions.extend(forwarder.handle(
+                    now,
+                    ForwardEvent::OutboundMulticast {
+                        destinations,
+                        packet,
+                    },
+                ));
+            }
+            PubSubAction::DeliverToApp { sub_id, message } => {
+                let _ = outcomes
+                    .send(PubSubOutcome::Delivered { sub_id, message })
+                    .await;
+            }
+            PubSubAction::LocalSubscriptionsChanged(_) => {}
+            PubSubAction::Published { topic, seq } => {
+                let _ = outcomes.send(PubSubOutcome::Published { topic, seq }).await;
+            }
+            PubSubAction::Rejected(reason) => {
+                let _ = outcomes.send(PubSubOutcome::Rejected(reason)).await;
+            }
+            PubSubAction::Dropped(reason) => {
+                let _ = outcomes.try_send(PubSubOutcome::Dropped(reason));
+            }
+        }
+    }
+    forward_actions
 }
 
 fn report_drop(outcomes: &mpsc::Sender<ForwardOutcome>, reason: DropReason, packet: ForwardPacket) {
@@ -974,6 +1273,14 @@ fn encode_control_frame(frame: &ControlFrame) -> Result<WireFrame, RuntimeError>
                 message.lsa.adjacencies.len(),
                 MAX_LSA_ADJACENCIES,
             )?;
+            ensure_limit("Lsa.topics", message.lsa.topics.len(), MAX_LSA_TOPIC_ADS)?;
+            let mut unique_topics = BTreeSet::new();
+            for ad in &message.lsa.topics {
+                validate_topic_ad(&ad.topic, &ad.partition, u32::from(ad.roles.bits()))?;
+                if !unique_topics.insert((&ad.topic, &ad.partition)) {
+                    return Err(RuntimeError::DuplicateTopicAd);
+                }
+            }
             let lsa_bytes = if message.canonical_bytes.is_empty() {
                 encode_lsa(&message.lsa)
             } else {
@@ -1087,6 +1394,17 @@ fn encode_lsa(lsa: &Lsa) -> Vec<u8> {
                 cost: u32::from(adjacency.cost.get()),
             })
             .collect(),
+        topics: lsa
+            .topics
+            .iter()
+            .map(|ad| proto::TopicAd {
+                topic: ad.topic.clone(),
+                partition: ad.partition.clone(),
+                role: u32::from(ad.roles.bits()),
+                head_seq: ad.head_seq,
+                tail_seq: ad.tail_seq,
+            })
+            .collect(),
         epoch: lsa.epoch,
     }
     .encode_to_vec()
@@ -1102,6 +1420,7 @@ fn decode_lsa(wire_lsa: proto::Lsa) -> Result<Lsa, RuntimeError> {
         wire_lsa.adjacencies.len(),
         MAX_LSA_ADJACENCIES,
     )?;
+    ensure_limit("Lsa.topics", wire_lsa.topics.len(), MAX_LSA_TOPIC_ADS)?;
     let adjacencies = wire_lsa
         .adjacencies
         .into_iter()
@@ -1114,13 +1433,54 @@ fn decode_lsa(wire_lsa: proto::Lsa) -> Result<Lsa, RuntimeError> {
             Ok(Adjacency { peer, cost })
         })
         .collect::<Result<Vec<_>, RuntimeError>>()?;
+    let topics = wire_lsa
+        .topics
+        .into_iter()
+        .map(|ad| {
+            let roles = validate_topic_ad(&ad.topic, &ad.partition, ad.role)?;
+            Ok(TopicAd {
+                topic: ad.topic,
+                partition: ad.partition,
+                roles,
+                head_seq: ad.head_seq,
+                tail_seq: ad.tail_seq,
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    let unique_topics = topics
+        .iter()
+        .map(|ad| (&ad.topic, &ad.partition))
+        .collect::<BTreeSet<_>>();
+    if unique_topics.len() != topics.len() {
+        return Err(RuntimeError::DuplicateTopicAd);
+    }
     Ok(Lsa {
         origin,
         epoch: wire_lsa.epoch,
         seq: wire_lsa.seq,
         ttl_sec: wire_lsa.ttl_sec,
         adjacencies,
+        topics,
     })
+}
+
+fn validate_topic_ad(
+    topic: &str,
+    partition: &[u8],
+    raw_roles: u32,
+) -> Result<TopicRoles, RuntimeError> {
+    if topic.is_empty() {
+        return Err(RuntimeError::InvalidTopicName);
+    }
+    if topic.len() > MAX_TOPIC_NAME_LEN {
+        return Err(RuntimeError::TopicNameTooLong(topic.len()));
+    }
+    if partition.len() > MAX_TOPIC_PARTITION_LEN {
+        return Err(RuntimeError::TopicPartitionTooLong(partition.len()));
+    }
+    let role_bits =
+        u8::try_from(raw_roles).map_err(|_| RuntimeError::InvalidTopicRole(raw_roles))?;
+    TopicRoles::from_bits(role_bits).ok_or(RuntimeError::InvalidTopicRole(raw_roles))
 }
 
 fn ensure_limit(field: &'static str, count: usize, limit: usize) -> Result<(), RuntimeError> {
@@ -1234,6 +1594,13 @@ mod tests {
                 peer: node(2),
                 cost: LinkCost::new(9).expect("cost must be valid"),
             }],
+            topics: vec![TopicAd {
+                topic: "lattice.tracks.v1".to_owned(),
+                partition: b"drone-17".to_vec(),
+                roles: TopicRoles::SUBSCRIBE,
+                head_seq: 0,
+                tail_seq: 0,
+            }],
         };
         let frame = ControlFrame::Lsa(LsaMessage {
             lsa: original_lsa.clone(),
@@ -1255,6 +1622,94 @@ mod tests {
         let signed =
             proto::SignedLsa::decode(reencoded.payload).expect("forwarded SignedLsa must decode");
         assert_eq!(signed.lsa_bytes, message.canonical_bytes.as_ref());
+    }
+
+    #[test]
+    fn forwarded_lsa_preserves_unknown_protobuf_fields_byte_for_byte() {
+        let mut lsa_bytes = proto::Lsa {
+            origin: node(1).as_bytes().to_vec(),
+            seq: 1,
+            ttl_sec: 300,
+            adjacencies: Vec::new(),
+            topics: vec![proto::TopicAd {
+                topic: "lattice.tracks.v1".to_owned(),
+                partition: b"drone-17".to_vec(),
+                role: u32::from(TopicRoles::SUBSCRIBE.bits()),
+                head_seq: 0,
+                tail_seq: 0,
+            }],
+            epoch: 1,
+        }
+        .encode_to_vec();
+        lsa_bytes.extend_from_slice(&[0x98, 0x06, 0x07]);
+        let original = lsa_bytes.clone();
+        let wire = WireFrame::control(
+            FrameType::Lsa,
+            proto::SignedLsa {
+                lsa_bytes,
+                signature: vec![9],
+            }
+            .encode_to_vec(),
+        );
+
+        let decoded = decode_control_frame(wire).expect("LSA with unknown field must decode");
+        let forwarded = encode_control_frame(&decoded).expect("decoded LSA must forward");
+        let signed =
+            proto::SignedLsa::decode(forwarded.payload).expect("forwarded signed LSA must decode");
+
+        assert_eq!(signed.lsa_bytes, original);
+        assert_eq!(signed.signature, vec![9]);
+    }
+
+    #[test]
+    fn topic_ads_build_deterministic_subscriber_discovery() {
+        let exact = TopicKey::new("lattice.tracks.v1", Bytes::from_static(b"drone-17"))
+            .expect("topic must be valid");
+        let other = TopicKey::new("lattice.tracks.v1", Bytes::from_static(b"drone-18"))
+            .expect("topic must be valid");
+        let ads = vec![
+            DiscoveredTopicAd {
+                node: node(3),
+                ad: TopicAd {
+                    topic: "lattice.tracks.v1".to_owned(),
+                    partition: b"drone-17".to_vec(),
+                    roles: TopicRoles::SUBSCRIBE,
+                    head_seq: 0,
+                    tail_seq: 0,
+                },
+            },
+            DiscoveredTopicAd {
+                node: node(2),
+                ad: TopicAd {
+                    topic: "lattice.tracks.v1".to_owned(),
+                    partition: Vec::new(),
+                    roles: TopicRoles::SUBSCRIBE,
+                    head_seq: 0,
+                    tail_seq: 0,
+                },
+            },
+            DiscoveredTopicAd {
+                node: node(4),
+                ad: TopicAd {
+                    topic: "lattice.tracks.v1".to_owned(),
+                    partition: b"drone-17".to_vec(),
+                    roles: TopicRoles::PUBLISH,
+                    head_seq: 1,
+                    tail_seq: 0,
+                },
+            },
+        ];
+
+        let discovery = discovery_from_topic_ads(&ads);
+
+        assert_eq!(
+            discovery.subscribers(&exact),
+            [node(2), node(3)].into_iter().collect()
+        );
+        assert_eq!(
+            discovery.subscribers(&other),
+            [node(2)].into_iter().collect()
+        );
     }
 
     #[test]
@@ -1282,6 +1737,7 @@ mod tests {
             seq: 1,
             ttl_sec: 300,
             adjacencies: Vec::new(),
+            topics: Vec::new(),
             epoch: 1,
         };
         let signed = proto::SignedLsa {
@@ -1293,6 +1749,33 @@ mod tests {
         assert!(matches!(
             decode_control_frame(frame),
             Err(RuntimeError::InvalidNodeIdLength(31))
+        ));
+
+        let invalid_topic = proto::Lsa {
+            origin: node(1).as_bytes().to_vec(),
+            seq: 1,
+            ttl_sec: 300,
+            adjacencies: Vec::new(),
+            topics: vec![proto::TopicAd {
+                topic: "lattice.tracks.v1".to_owned(),
+                partition: Vec::new(),
+                role: 0,
+                head_seq: 0,
+                tail_seq: 0,
+            }],
+            epoch: 1,
+        };
+        let frame = WireFrame::control(
+            FrameType::Lsa,
+            proto::SignedLsa {
+                lsa_bytes: invalid_topic.encode_to_vec(),
+                signature: Vec::new(),
+            }
+            .encode_to_vec(),
+        );
+        assert!(matches!(
+            decode_control_frame(frame),
+            Err(RuntimeError::InvalidTopicRole(0))
         ));
     }
 
@@ -1340,6 +1823,7 @@ mod tests {
                 seq: 1,
                 ttl_sec: 0,
                 adjacencies: Vec::new(),
+                topics: Vec::new(),
             },
             canonical_bytes: Arc::from([]),
             signature: Arc::from([]),
@@ -1347,6 +1831,33 @@ mod tests {
         assert!(matches!(
             encode_control_frame(&invalid_ttl),
             Err(RuntimeError::InvalidLsaTtl(0))
+        ));
+
+        let topic = TopicAd {
+            topic: "lattice.tracks.v1".to_owned(),
+            partition: Vec::new(),
+            roles: TopicRoles::SUBSCRIBE,
+            head_seq: 0,
+            tail_seq: 0,
+        };
+        let oversized_topics = ControlFrame::Lsa(LsaMessage {
+            lsa: Lsa {
+                origin: node(1),
+                epoch: 1,
+                seq: 1,
+                ttl_sec: 300,
+                adjacencies: Vec::new(),
+                topics: vec![topic; MAX_LSA_TOPIC_ADS + 1],
+            },
+            canonical_bytes: Arc::from([]),
+            signature: Arc::from([]),
+        });
+        assert!(matches!(
+            encode_control_frame(&oversized_topics),
+            Err(RuntimeError::TooManyElements {
+                field: "Lsa.topics",
+                ..
+            })
         ));
     }
 

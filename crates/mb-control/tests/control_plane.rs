@@ -1,8 +1,9 @@
 use mb_control::{
-    Adjacency, ControlAction, ControlEvent, ControlFrame, ControlPlane, ControlTimer, LinkCost,
-    Lsa, LsaMessage, RouteTable, DEFAULT_LSA_TTL_SEC, DIGEST_INTERVAL_MS, MAX_DIGEST_ENTRIES,
-    MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSDB_ENTRIES, SPF_INITIAL_HOLD_MS,
-    SPF_MAX_HOLD_MS, SPF_QUIET_RESET_MS,
+    Adjacency, ControlAction, ControlEvent, ControlFrame, ControlPlane, ControlTimer,
+    DiscoveredTopicAd, LinkCost, Lsa, LsaMessage, RouteTable, TopicAd, TopicRoles,
+    DEFAULT_LSA_TTL_SEC, DIGEST_INTERVAL_MS, MAX_DIGEST_ENTRIES, MAX_DIGEST_REQ_ORIGINS,
+    MAX_LSA_ADJACENCIES, MAX_LSDB_ENTRIES, SPF_INITIAL_HOLD_MS, SPF_MAX_HOLD_MS,
+    SPF_QUIET_RESET_MS,
 };
 use mb_types::{Component, LinkId, MonoTime, NodeId};
 use std::collections::BTreeMap;
@@ -44,9 +45,20 @@ fn reciprocal_lsa(origin: NodeId, peer: NodeId, seq: u64) -> LsaMessage {
                 peer,
                 cost: cost(10),
             }],
+            topics: Vec::new(),
         },
         canonical_bytes: Arc::from([]),
         signature: Arc::from([]),
+    }
+}
+
+fn subscription(topic: &str, partition: &[u8]) -> TopicAd {
+    TopicAd {
+        topic: topic.to_owned(),
+        partition: partition.to_vec(),
+        roles: TopicRoles::SUBSCRIBE,
+        head_seq: 0,
+        tail_seq: 0,
     }
 }
 
@@ -66,6 +78,7 @@ struct Harness {
     now_ms: u64,
     event_log: Vec<String>,
     route_publications: Vec<(u64, usize, Arc<RouteTable>)>,
+    topic_publications: Vec<(u64, usize, Arc<Vec<DiscoveredTopicAd>>)>,
 }
 
 impl Harness {
@@ -83,6 +96,7 @@ impl Harness {
             now_ms: 0,
             event_log: Vec::new(),
             route_publications: Vec::new(),
+            topic_publications: Vec::new(),
         }
     }
 
@@ -181,6 +195,9 @@ impl Harness {
                     }
                     ControlAction::PublishRoutes(routes) => {
                         self.route_publications.push((self.now_ms, target, routes));
+                    }
+                    ControlAction::PublishTopicAds(ads) => {
+                        self.topic_publications.push((self.now_ms, target, ads));
                     }
                     ControlAction::SetTimer { .. } | ControlAction::PersistSeq(_) => {}
                 }
@@ -281,6 +298,7 @@ fn one_sided_adjacency_is_never_used_for_routing() {
                 peer: ids[0],
                 cost: cost(1),
             }],
+            topics: Vec::new(),
         },
     );
     harness.run_until_idle();
@@ -725,6 +743,7 @@ fn newer_self_origin_lsa_is_not_reflected_back_to_the_peer() {
                     seq: 2,
                     ttl_sec: 300,
                     adjacencies: Vec::new(),
+                    topics: Vec::new(),
                 },
                 canonical_bytes: Arc::from([]),
                 signature: Arc::from([]),
@@ -819,6 +838,7 @@ fn remote_lsa_becomes_a_permanent_compact_tombstone() {
             peer: me,
             cost: cost(10),
         }],
+        topics: Vec::new(),
     };
     let canonical_bytes: Arc<[u8]> = Arc::from([1_u8, 2, 3]);
     let receive_actions = plane.handle(
@@ -938,6 +958,7 @@ fn timers_for_a_replaced_lsa_are_ignored() {
                             peer: me,
                             cost: cost(10),
                         }],
+                        topics: Vec::new(),
                     },
                     canonical_bytes: Arc::from([]),
                     signature: Arc::from([]),
@@ -1001,6 +1022,7 @@ fn oversized_control_collections_and_invalid_ttl_are_rejected() {
             seq: 1,
             ttl_sec: 0,
             adjacencies: Vec::new(),
+            topics: Vec::new(),
         },
         canonical_bytes: Arc::from([]),
         signature: Arc::from([]),
@@ -1026,6 +1048,7 @@ fn oversized_control_collections_and_invalid_ttl_are_rejected() {
             seq: 1,
             ttl_sec: DEFAULT_LSA_TTL_SEC,
             adjacencies: vec![adjacency; MAX_LSA_ADJACENCIES + 1],
+            topics: Vec::new(),
         },
         canonical_bytes: Arc::from([]),
         signature: Arc::from([]),
@@ -1097,6 +1120,7 @@ fn lsdb_size_is_bounded() {
                         seq: 1,
                         ttl_sec: DEFAULT_LSA_TTL_SEC,
                         adjacencies: Vec::new(),
+                        topics: Vec::new(),
                     },
                     canonical_bytes: Arc::from([]),
                     signature: Arc::from([]),
@@ -1132,6 +1156,7 @@ fn lsdb_size_is_bounded() {
                     seq: 1,
                     ttl_sec: DEFAULT_LSA_TTL_SEC,
                     adjacencies: Vec::new(),
+                    topics: Vec::new(),
                 },
                 canonical_bytes: Arc::from([]),
                 signature: Arc::from([]),
@@ -1140,4 +1165,110 @@ fn lsdb_size_is_bounded() {
     );
     assert!(plane.lsa(&unknown).is_none());
     assert_eq!(plane.lsa_is_expired(&first_remote), Some(true));
+}
+
+#[test]
+fn local_topic_ads_are_flooded_and_published_as_deterministic_discovery() {
+    let me = node(1);
+    let peer = node(2);
+    let link = LinkId::new(1);
+    let mut plane = ControlPlane::new_unsecured(me, 1);
+    let initial = plane.handle(
+        MonoTime::ZERO,
+        ControlEvent::LinkUp {
+            link,
+            peer,
+            cost: cost(10),
+        },
+    );
+    let (spf_timer, spf_at) = scheduled_spf(&initial);
+    let tracks = subscription("lattice.tracks.v1", b"drone-17");
+
+    let changed = plane.handle(
+        MonoTime::from_millis(1),
+        ControlEvent::LocalTopicAdsChanged(vec![tracks.clone()]),
+    );
+    assert!(changed.iter().any(|action| matches!(
+        action,
+        ControlAction::Send {
+            frame: ControlFrame::Lsa(message),
+            ..
+        } if message.lsa.topics == vec![tracks.clone()]
+    )));
+    assert_eq!(
+        plane.lsa(&me).map(|lsa| lsa.topics.as_slice()),
+        Some([tracks.clone()].as_slice())
+    );
+
+    let published = plane.handle(spf_at, ControlEvent::Timer(spf_timer));
+    let discovered = published
+        .iter()
+        .find_map(|action| match action {
+            ControlAction::PublishTopicAds(ads) => Some(ads),
+            _ => None,
+        })
+        .expect("topic discovery must be published even when routes do not change");
+    assert_eq!(discovered.len(), 1);
+    assert_eq!(discovered[0].node, me);
+    assert_eq!(discovered[0].ad, tracks);
+
+    assert!(plane
+        .handle(
+            MonoTime::from_millis(spf_at.as_millis() + 1),
+            ControlEvent::LocalTopicAdsChanged(vec![discovered[0].ad.clone()]),
+        )
+        .is_empty());
+
+    let removed_at = MonoTime::from_millis(spf_at.as_millis() + 2);
+    let removed = plane.handle(removed_at, ControlEvent::LocalTopicAdsChanged(Vec::new()));
+    assert!(plane
+        .lsa(&me)
+        .expect("local LSA must remain active")
+        .topics
+        .is_empty());
+    let (remove_timer, remove_timer_at) = scheduled_spf(&removed);
+    let removal_publication = plane.handle(remove_timer_at, ControlEvent::Timer(remove_timer));
+    assert!(removal_publication
+        .iter()
+        .any(|action| matches!(action, ControlAction::PublishTopicAds(ads) if ads.is_empty())));
+}
+
+#[test]
+fn subscriber_discovery_converges_and_is_removed_across_a_three_node_chain() {
+    let ids = [node(1), node(2), node(3)];
+    let mut harness = Harness::new(&ids);
+    harness.connect(0, 1, cost(10));
+    harness.connect(1, 2, cost(10));
+    harness.run_until_idle();
+
+    let tracks = subscription("lattice.tracks.v1", b"drone-17");
+    harness.schedule_next(2, ControlEvent::LocalTopicAdsChanged(vec![tracks.clone()]));
+    harness.run_until_idle();
+
+    for target in 0..ids.len() {
+        let ads = &harness
+            .topic_publications
+            .iter()
+            .rev()
+            .find(|(_, node_index, _)| *node_index == target)
+            .expect("every node must publish converged subscriber discovery")
+            .2;
+        assert_eq!(ads.len(), 1);
+        assert_eq!(ads[0].node, ids[2]);
+        assert_eq!(ads[0].ad, tracks);
+    }
+
+    harness.schedule_next(2, ControlEvent::LocalTopicAdsChanged(Vec::new()));
+    harness.run_until_idle();
+
+    for target in 0..ids.len() {
+        let ads = &harness
+            .topic_publications
+            .iter()
+            .rev()
+            .find(|(_, node_index, _)| *node_index == target)
+            .expect("every node must publish subscriber removal")
+            .2;
+        assert!(ads.is_empty());
+    }
 }

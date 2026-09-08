@@ -6,6 +6,7 @@ members = [
     "crates/mb-transport",
     "crates/mb-runtime",
     "crates/mb-forward",
+    "crates/mb-pubsub",
     "bins/mblab-node",
     "bins/mblab",
 ]

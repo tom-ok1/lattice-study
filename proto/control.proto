@@ -14,12 +14,20 @@ message Adjacency {
   uint32 cost = 2;
 }
 
-// This slice deliberately carries only the fields understood by mb-control.
+message TopicAd {
+  string topic = 1;
+  bytes partition = 2;
+  uint32 role = 3;
+  uint64 head_seq = 4;
+  uint64 tail_seq = 5;
+}
+
 message Lsa {
   bytes origin = 1;
   uint64 seq = 2;
   uint32 ttl_sec = 4;
   repeated Adjacency adjacencies = 10;
+  repeated TopicAd topics = 13;
   uint32 epoch = 20;
 }
 
