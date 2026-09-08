@@ -160,6 +160,14 @@ impl TopicSelector {
                 .as_ref()
                 .map_or(true, |partition| partition == &topic.partition)
     }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn partition(&self) -> Option<&Bytes> {
+        self.partition.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -349,6 +357,7 @@ pub enum PubSubAction {
         sub_id: SubId,
         message: DeliveredMessage,
     },
+    LocalSubscriptionsChanged(Vec<TopicSelector>),
     Published {
         topic: TopicKey,
         seq: u64,
@@ -419,6 +428,21 @@ impl PubSub {
 
     pub fn node_id(&self) -> NodeId {
         self.me
+    }
+
+    fn effective_subscriptions(&self) -> BTreeSet<TopicSelector> {
+        self.local_subscriptions.values().cloned().collect()
+    }
+
+    fn subscription_change(&self, previous: BTreeSet<TopicSelector>) -> Vec<PubSubAction> {
+        let current = self.effective_subscriptions();
+        if current == previous {
+            Vec::new()
+        } else {
+            vec![PubSubAction::LocalSubscriptionsChanged(
+                current.into_iter().collect(),
+            )]
+        }
     }
 
     fn publish(&mut self, now: MonoTime, topic: TopicKey, payload: Bytes) -> Vec<PubSubAction> {
@@ -553,12 +577,14 @@ impl Component for PubSub {
         match event {
             PubSubEvent::LocalPublish { topic, payload } => self.publish(now, topic, payload),
             PubSubEvent::LocalSubscribe { sub_id, selector } => {
+                let previous = self.effective_subscriptions();
                 self.local_subscriptions.insert(sub_id, selector);
-                Vec::new()
+                self.subscription_change(previous)
             }
             PubSubEvent::LocalUnsubscribe(sub_id) => {
+                let previous = self.effective_subscriptions();
                 self.local_subscriptions.remove(&sub_id);
-                Vec::new()
+                self.subscription_change(previous)
             }
             PubSubEvent::Inbound { source, payload } => self.receive(source, payload),
             PubSubEvent::DiscoveryUpdated(discovery) => {
@@ -703,6 +729,41 @@ mod tests {
                     is_backfill: false,
                 },
             }]
+        );
+    }
+
+    #[test]
+    fn subscription_ads_change_only_when_the_effective_selector_set_changes() {
+        let mut pubsub = PubSub::new(node(1), policies());
+        let selector = TopicSelector::exact(topic(b"drone-17"));
+
+        assert_eq!(
+            pubsub.handle(
+                MonoTime::ZERO,
+                PubSubEvent::LocalSubscribe {
+                    sub_id: SubId::new(1),
+                    selector: selector.clone(),
+                },
+            ),
+            vec![PubSubAction::LocalSubscriptionsChanged(vec![
+                selector.clone()
+            ])]
+        );
+        assert!(pubsub
+            .handle(
+                MonoTime::ZERO,
+                PubSubEvent::LocalSubscribe {
+                    sub_id: SubId::new(2),
+                    selector,
+                },
+            )
+            .is_empty());
+        assert!(pubsub
+            .handle(MonoTime::ZERO, PubSubEvent::LocalUnsubscribe(SubId::new(1)),)
+            .is_empty());
+        assert_eq!(
+            pubsub.handle(MonoTime::ZERO, PubSubEvent::LocalUnsubscribe(SubId::new(2)),),
+            vec![PubSubAction::LocalSubscriptionsChanged(Vec::new())]
         );
     }
 

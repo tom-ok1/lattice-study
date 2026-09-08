@@ -17,6 +17,9 @@ pub const DEFAULT_LSA_TTL_SEC: u32 = 300;
 pub const MAX_LSA_TTL_SEC: u32 = 3_600;
 pub const MAX_LSDB_ENTRIES: usize = 1_000;
 pub const MAX_LSA_ADJACENCIES: usize = 256;
+pub const MAX_LSA_TOPIC_ADS: usize = 256;
+pub const MAX_TOPIC_NAME_LEN: usize = 1_024;
+pub const MAX_TOPIC_PARTITION_LEN: usize = 64 * 1_024;
 pub const MAX_DIGEST_ENTRIES: usize = MAX_LSDB_ENTRIES;
 pub const MAX_DIGEST_REQ_ORIGINS: usize = MAX_LSDB_ENTRIES;
 
@@ -47,6 +50,47 @@ pub struct Adjacency {
     pub cost: LinkCost,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TopicRoles(u8);
+
+impl TopicRoles {
+    pub const PUBLISH: Self = Self(1);
+    pub const SUBSCRIBE: Self = Self(1 << 1);
+    pub const STORE: Self = Self(1 << 2);
+    const ALL: u8 = Self::PUBLISH.0 | Self::SUBSCRIBE.0 | Self::STORE.0;
+
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits != 0 && bits & !Self::ALL == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn contains(self, role: Self) -> bool {
+        self.0 & role.0 == role.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TopicAd {
+    pub topic: String,
+    pub partition: Vec<u8>,
+    pub roles: TopicRoles,
+    pub head_seq: u64,
+    pub tail_seq: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DiscoveredTopicAd {
+    pub node: NodeId,
+    pub ad: TopicAd,
+}
+
 /// Minimal LSA used by the first control-plane slice.
 ///
 /// Service, topic, and address fields can be added without changing the
@@ -58,6 +102,7 @@ pub struct Lsa {
     pub seq: u64,
     pub ttl_sec: u32,
     pub adjacencies: Vec<Adjacency>,
+    pub topics: Vec<TopicAd>,
 }
 
 /// Transport-neutral LSA container.
@@ -167,6 +212,7 @@ pub enum ControlEvent {
     LinkDown {
         link: LinkId,
     },
+    LocalTopicAdsChanged(Vec<TopicAd>),
     Frame {
         link: LinkId,
         frame: ControlFrame,
@@ -179,6 +225,7 @@ pub enum ControlAction {
     Send { link: LinkId, frame: ControlFrame },
     SetTimer { timer: ControlTimer, at: MonoTime },
     PublishRoutes(Arc<RouteTable>),
+    PublishTopicAds(Arc<Vec<DiscoveredTopicAd>>),
     PersistSeq(u64),
 }
 
@@ -262,8 +309,10 @@ pub struct ControlPlane {
     epoch: u32,
     my_seq: u64,
     adjacencies: BTreeMap<LinkId, LocalAdjacency>,
+    local_topic_ads: Vec<TopicAd>,
     lsdb: BTreeMap<NodeId, LsdbEntry>,
     routes: Arc<RouteTable>,
+    published_topic_ads: Arc<Vec<DiscoveredTopicAd>>,
     pending_spf: Option<PendingSpf>,
     spf_generation: u64,
     spf_hold_ms: u64,
@@ -310,8 +359,10 @@ impl ControlPlane {
             epoch,
             my_seq: last_seq,
             adjacencies: BTreeMap::new(),
+            local_topic_ads: Vec::new(),
             lsdb: BTreeMap::new(),
             routes: Arc::new(RouteTable::default()),
+            published_topic_ads: Arc::new(Vec::new()),
             pending_spf: None,
             spf_generation: 0,
             spf_hold_ms: SPF_INITIAL_HOLD_MS,
@@ -375,6 +426,7 @@ impl ControlPlane {
                 .into_iter()
                 .map(|(peer, cost)| Adjacency { peer, cost })
                 .collect(),
+            topics: self.local_topic_ads.clone(),
         };
         let message = self.signer.sign(lsa);
         let expiry = self
@@ -436,7 +488,25 @@ impl ControlPlane {
     }
 
     fn valid_lsa(lsa: &Lsa) -> bool {
-        (1..=MAX_LSA_TTL_SEC).contains(&lsa.ttl_sec) && lsa.adjacencies.len() <= MAX_LSA_ADJACENCIES
+        (1..=MAX_LSA_TTL_SEC).contains(&lsa.ttl_sec)
+            && lsa.adjacencies.len() <= MAX_LSA_ADJACENCIES
+            && Self::valid_topic_ads(&lsa.topics)
+    }
+
+    fn valid_topic_ads(ads: &[TopicAd]) -> bool {
+        ads.len() <= MAX_LSA_TOPIC_ADS
+            && ads.iter().all(|ad| {
+                !ad.topic.is_empty()
+                    && ad.topic.len() <= MAX_TOPIC_NAME_LEN
+                    && ad.partition.len() <= MAX_TOPIC_PARTITION_LEN
+                    && TopicRoles::from_bits(ad.roles.bits()).is_some()
+            })
+            && ads
+                .iter()
+                .map(|ad| (&ad.topic, &ad.partition))
+                .collect::<BTreeSet<_>>()
+                .len()
+                == ads.len()
     }
 
     fn is_newer(&self, candidate: &Lsa) -> bool {
@@ -702,7 +772,11 @@ impl ControlPlane {
 
         self.pending_spf = None;
         self.spf_hold_ms = self.spf_hold_ms.saturating_mul(2).min(SPF_MAX_HOLD_MS);
-        self.recompute_routes().into_iter().collect()
+        let mut actions = self.recompute_routes().into_iter().collect::<Vec<_>>();
+        if let Some(action) = self.recompute_topic_ads() {
+            actions.push(action);
+        }
+        actions
     }
 
     fn recompute_routes(&mut self) -> Option<ControlAction> {
@@ -717,6 +791,30 @@ impl ControlPlane {
         });
         self.routes = Arc::clone(&table);
         Some(ControlAction::PublishRoutes(table))
+    }
+
+    fn recompute_topic_ads(&mut self) -> Option<ControlAction> {
+        let mut discovered = self
+            .lsdb
+            .iter()
+            .filter_map(|(node, entry)| entry.active().map(|active| (*node, active)))
+            .flat_map(|(node, active)| {
+                active
+                    .message
+                    .lsa
+                    .topics
+                    .iter()
+                    .cloned()
+                    .map(move |ad| DiscoveredTopicAd { node, ad })
+            })
+            .collect::<Vec<_>>();
+        discovered.sort();
+        if discovered.as_slice() == self.published_topic_ads.as_slice() {
+            return None;
+        }
+        let discovered = Arc::new(discovered);
+        self.published_topic_ads = Arc::clone(&discovered);
+        Some(ControlAction::PublishTopicAds(discovered))
     }
 
     fn shortest_paths(&self) -> BTreeMap<NodeId, Route> {
@@ -839,6 +937,15 @@ impl Component for ControlPlane {
                 if self.adjacencies.remove(&link).is_none() {
                     Vec::new()
                 } else {
+                    self.originate_lsa(now)
+                }
+            }
+            ControlEvent::LocalTopicAdsChanged(mut ads) => {
+                ads.sort();
+                if !Self::valid_topic_ads(&ads) || ads == self.local_topic_ads {
+                    Vec::new()
+                } else {
+                    self.local_topic_ads = ads;
                     self.originate_lsa(now)
                 }
             }

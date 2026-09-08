@@ -1,8 +1,6 @@
 use bytes::Bytes;
 use mb_control::LinkCost;
-use mb_pubsub::{
-    DiscoveryIndex, SubId, TopicKey, TopicMode, TopicPolicies, TopicPolicy, TopicSelector,
-};
+use mb_pubsub::{SubId, TopicKey, TopicMode, TopicPolicies, TopicPolicy, TopicSelector};
 use mb_runtime::{ControlRuntime, ForwardOutcome, PubSubOutcome, RuntimeConfig};
 use mb_transport::TcpEndpoint;
 use mb_types::NodeId;
@@ -252,13 +250,6 @@ async fn three_nodes_converge_and_forward_over_real_loopback_tcp_links() {
         .subscribe(subscription_id, TopicSelector::exact(tracks.clone()))
         .await
         .expect("C must accept a local subscription");
-    let mut discovery = DiscoveryIndex::default();
-    discovery.set_subscribers(TopicSelector::exact(tracks.clone()), [c]);
-    runtime_a
-        .update_pubsub_discovery(Arc::new(discovery))
-        .await
-        .expect("A must accept subscriber discovery");
-
     let (delivered_sub_id, delivered_message) =
         wait_for_pubsub_delivery(&runtime_a, &mut pubsub_outcomes_c, tracks.clone()).await;
     assert_eq!(delivered_sub_id, subscription_id);

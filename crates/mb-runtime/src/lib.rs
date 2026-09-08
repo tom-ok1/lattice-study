@@ -3,8 +3,9 @@
 use bytes::Bytes;
 use mb_control::{
     Adjacency, ControlAction, ControlEvent, ControlFrame, ControlPlane, ControlTimer, DigestEntry,
-    InvalidLinkCost, LinkCost, Lsa, LsaMessage, MAX_DIGEST_ENTRIES, MAX_DIGEST_REQ_ORIGINS,
-    MAX_LSA_ADJACENCIES, MAX_LSA_TTL_SEC,
+    DiscoveredTopicAd, InvalidLinkCost, LinkCost, Lsa, LsaMessage, TopicAd, TopicRoles,
+    MAX_DIGEST_ENTRIES, MAX_DIGEST_REQ_ORIGINS, MAX_LSA_ADJACENCIES, MAX_LSA_TOPIC_ADS,
+    MAX_LSA_TTL_SEC, MAX_TOPIC_NAME_LEN, MAX_TOPIC_PARTITION_LEN,
 };
 use mb_forward::{DropReason, ForwardAction, ForwardEvent, ForwardTimer, Forwarder};
 use mb_pubsub::{
@@ -19,7 +20,7 @@ use mb_wire::{
 };
 use prost::Message;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -293,6 +294,11 @@ pub enum RuntimeError {
     InvalidNodeIdLength(usize),
     InvalidLinkCost(u32),
     InvalidLsaTtl(u32),
+    InvalidTopicName,
+    InvalidTopicRole(u32),
+    TopicNameTooLong(usize),
+    TopicPartitionTooLong(usize),
+    DuplicateTopicAd,
     TooManyElements {
         field: &'static str,
         count: usize,
@@ -328,6 +334,19 @@ impl fmt::Display for RuntimeError {
             }
             Self::InvalidLinkCost(cost) => write!(f, "invalid link cost {cost}"),
             Self::InvalidLsaTtl(ttl) => write!(f, "invalid LSA ttl_sec {ttl}"),
+            Self::InvalidTopicName => f.write_str("LSA topic name must not be empty"),
+            Self::InvalidTopicRole(role) => write!(f, "invalid LSA topic role bits {role:#x}"),
+            Self::TopicNameTooLong(length) => write!(
+                f,
+                "LSA topic name length {length} exceeds the {MAX_TOPIC_NAME_LEN} byte limit"
+            ),
+            Self::TopicPartitionTooLong(length) => write!(
+                f,
+                "LSA topic partition length {length} exceeds the {MAX_TOPIC_PARTITION_LEN} byte limit"
+            ),
+            Self::DuplicateTopicAd => {
+                f.write_str("LSA contains duplicate topic and partition advertisements")
+            }
             Self::TooManyElements {
                 field,
                 count,
@@ -518,16 +537,6 @@ impl ControlRuntime {
             .map_err(|_| RuntimeError::RuntimeStopped)
     }
 
-    pub async fn update_pubsub_discovery(
-        &self,
-        discovery: Arc<DiscoveryIndex>,
-    ) -> Result<(), RuntimeError> {
-        self.pubsub_inputs
-            .send(PubSubEvent::DiscoveryUpdated(discovery))
-            .await
-            .map_err(|_| RuntimeError::RuntimeStopped)
-    }
-
     pub async fn send(&self, packet: ForwardPacket) -> Result<(), RuntimeError> {
         ForwardPacketCodec::encode(&packet)?;
         self.forward_inputs
@@ -678,6 +687,25 @@ async fn run_runtime_loop(
             }
         }
 
+        if let Some(selectors) = pubsub_actions.iter().find_map(|action| match action {
+            PubSubAction::LocalSubscriptionsChanged(selectors) => Some(selectors),
+            _ => None,
+        }) {
+            let ads = selectors
+                .iter()
+                .map(|selector| TopicAd {
+                    topic: selector.name().to_owned(),
+                    partition: selector
+                        .partition()
+                        .map_or_else(Vec::new, |partition| partition.to_vec()),
+                    roles: TopicRoles::SUBSCRIBE,
+                    head_seq: 0,
+                    tail_seq: 0,
+                })
+                .collect();
+            control_event = Some(ControlEvent::LocalTopicAdsChanged(ads));
+        }
+
         if let Some(event) = control_event {
             for action in plane.handle(now, event) {
                 match action {
@@ -697,6 +725,14 @@ async fn run_runtime_loop(
                             cores
                                 .forwarder
                                 .handle(now, ForwardEvent::RoutesUpdated(routes)),
+                        );
+                    }
+                    ControlAction::PublishTopicAds(ads) => {
+                        let discovery = discovery_from_topic_ads(&ads);
+                        pubsub_actions.extend(
+                            cores
+                                .pubsub
+                                .handle(now, PubSubEvent::DiscoveryUpdated(Arc::new(discovery))),
                         );
                     }
                     ControlAction::PersistSeq(seq) => {
@@ -725,6 +761,37 @@ async fn run_runtime_loop(
         )
         .await;
     }
+}
+
+fn discovery_from_topic_ads(ads: &[DiscoveredTopicAd]) -> DiscoveryIndex {
+    let mut subscribers = BTreeMap::<TopicSelector, BTreeSet<NodeId>>::new();
+    for discovered in ads {
+        if !discovered.ad.roles.contains(TopicRoles::SUBSCRIBE) {
+            continue;
+        }
+        let selector = if discovered.ad.partition.is_empty() {
+            TopicSelector::all_partitions(discovered.ad.topic.clone())
+                .expect("validated LSA topic must remain valid for Pub/Sub")
+        } else {
+            TopicSelector::exact(
+                TopicKey::new(
+                    discovered.ad.topic.clone(),
+                    Bytes::copy_from_slice(&discovered.ad.partition),
+                )
+                .expect("validated LSA topic must remain valid for Pub/Sub"),
+            )
+        };
+        subscribers
+            .entry(selector)
+            .or_default()
+            .insert(discovered.node);
+    }
+
+    let mut discovery = DiscoveryIndex::default();
+    for (selector, nodes) in subscribers {
+        discovery.set_subscribers(selector, nodes);
+    }
+    discovery
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -868,6 +935,7 @@ async fn execute_pubsub_actions(
                     .send(PubSubOutcome::Delivered { sub_id, message })
                     .await;
             }
+            PubSubAction::LocalSubscriptionsChanged(_) => {}
             PubSubAction::Published { topic, seq } => {
                 let _ = outcomes.send(PubSubOutcome::Published { topic, seq }).await;
             }
@@ -934,6 +1002,14 @@ fn encode_control_frame(frame: &ControlFrame) -> Result<WireFrame, RuntimeError>
                 message.lsa.adjacencies.len(),
                 MAX_LSA_ADJACENCIES,
             )?;
+            ensure_limit("Lsa.topics", message.lsa.topics.len(), MAX_LSA_TOPIC_ADS)?;
+            let mut unique_topics = BTreeSet::new();
+            for ad in &message.lsa.topics {
+                validate_topic_ad(&ad.topic, &ad.partition, u32::from(ad.roles.bits()))?;
+                if !unique_topics.insert((&ad.topic, &ad.partition)) {
+                    return Err(RuntimeError::DuplicateTopicAd);
+                }
+            }
             let lsa_bytes = if message.canonical_bytes.is_empty() {
                 encode_lsa(&message.lsa)
             } else {
@@ -1047,6 +1123,17 @@ fn encode_lsa(lsa: &Lsa) -> Vec<u8> {
                 cost: u32::from(adjacency.cost.get()),
             })
             .collect(),
+        topics: lsa
+            .topics
+            .iter()
+            .map(|ad| proto::TopicAd {
+                topic: ad.topic.clone(),
+                partition: ad.partition.clone(),
+                role: u32::from(ad.roles.bits()),
+                head_seq: ad.head_seq,
+                tail_seq: ad.tail_seq,
+            })
+            .collect(),
         epoch: lsa.epoch,
     }
     .encode_to_vec()
@@ -1062,6 +1149,7 @@ fn decode_lsa(wire_lsa: proto::Lsa) -> Result<Lsa, RuntimeError> {
         wire_lsa.adjacencies.len(),
         MAX_LSA_ADJACENCIES,
     )?;
+    ensure_limit("Lsa.topics", wire_lsa.topics.len(), MAX_LSA_TOPIC_ADS)?;
     let adjacencies = wire_lsa
         .adjacencies
         .into_iter()
@@ -1074,13 +1162,54 @@ fn decode_lsa(wire_lsa: proto::Lsa) -> Result<Lsa, RuntimeError> {
             Ok(Adjacency { peer, cost })
         })
         .collect::<Result<Vec<_>, RuntimeError>>()?;
+    let topics = wire_lsa
+        .topics
+        .into_iter()
+        .map(|ad| {
+            let roles = validate_topic_ad(&ad.topic, &ad.partition, ad.role)?;
+            Ok(TopicAd {
+                topic: ad.topic,
+                partition: ad.partition,
+                roles,
+                head_seq: ad.head_seq,
+                tail_seq: ad.tail_seq,
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    let unique_topics = topics
+        .iter()
+        .map(|ad| (&ad.topic, &ad.partition))
+        .collect::<BTreeSet<_>>();
+    if unique_topics.len() != topics.len() {
+        return Err(RuntimeError::DuplicateTopicAd);
+    }
     Ok(Lsa {
         origin,
         epoch: wire_lsa.epoch,
         seq: wire_lsa.seq,
         ttl_sec: wire_lsa.ttl_sec,
         adjacencies,
+        topics,
     })
+}
+
+fn validate_topic_ad(
+    topic: &str,
+    partition: &[u8],
+    raw_roles: u32,
+) -> Result<TopicRoles, RuntimeError> {
+    if topic.is_empty() {
+        return Err(RuntimeError::InvalidTopicName);
+    }
+    if topic.len() > MAX_TOPIC_NAME_LEN {
+        return Err(RuntimeError::TopicNameTooLong(topic.len()));
+    }
+    if partition.len() > MAX_TOPIC_PARTITION_LEN {
+        return Err(RuntimeError::TopicPartitionTooLong(partition.len()));
+    }
+    let role_bits =
+        u8::try_from(raw_roles).map_err(|_| RuntimeError::InvalidTopicRole(raw_roles))?;
+    TopicRoles::from_bits(role_bits).ok_or(RuntimeError::InvalidTopicRole(raw_roles))
 }
 
 fn ensure_limit(field: &'static str, count: usize, limit: usize) -> Result<(), RuntimeError> {
@@ -1194,6 +1323,13 @@ mod tests {
                 peer: node(2),
                 cost: LinkCost::new(9).expect("cost must be valid"),
             }],
+            topics: vec![TopicAd {
+                topic: "lattice.tracks.v1".to_owned(),
+                partition: b"drone-17".to_vec(),
+                roles: TopicRoles::SUBSCRIBE,
+                head_seq: 0,
+                tail_seq: 0,
+            }],
         };
         let frame = ControlFrame::Lsa(LsaMessage {
             lsa: original_lsa.clone(),
@@ -1215,6 +1351,94 @@ mod tests {
         let signed =
             proto::SignedLsa::decode(reencoded.payload).expect("forwarded SignedLsa must decode");
         assert_eq!(signed.lsa_bytes, message.canonical_bytes.as_ref());
+    }
+
+    #[test]
+    fn forwarded_lsa_preserves_unknown_protobuf_fields_byte_for_byte() {
+        let mut lsa_bytes = proto::Lsa {
+            origin: node(1).as_bytes().to_vec(),
+            seq: 1,
+            ttl_sec: 300,
+            adjacencies: Vec::new(),
+            topics: vec![proto::TopicAd {
+                topic: "lattice.tracks.v1".to_owned(),
+                partition: b"drone-17".to_vec(),
+                role: u32::from(TopicRoles::SUBSCRIBE.bits()),
+                head_seq: 0,
+                tail_seq: 0,
+            }],
+            epoch: 1,
+        }
+        .encode_to_vec();
+        lsa_bytes.extend_from_slice(&[0x98, 0x06, 0x07]);
+        let original = lsa_bytes.clone();
+        let wire = WireFrame::control(
+            FrameType::Lsa,
+            proto::SignedLsa {
+                lsa_bytes,
+                signature: vec![9],
+            }
+            .encode_to_vec(),
+        );
+
+        let decoded = decode_control_frame(wire).expect("LSA with unknown field must decode");
+        let forwarded = encode_control_frame(&decoded).expect("decoded LSA must forward");
+        let signed =
+            proto::SignedLsa::decode(forwarded.payload).expect("forwarded signed LSA must decode");
+
+        assert_eq!(signed.lsa_bytes, original);
+        assert_eq!(signed.signature, vec![9]);
+    }
+
+    #[test]
+    fn topic_ads_build_deterministic_subscriber_discovery() {
+        let exact = TopicKey::new("lattice.tracks.v1", Bytes::from_static(b"drone-17"))
+            .expect("topic must be valid");
+        let other = TopicKey::new("lattice.tracks.v1", Bytes::from_static(b"drone-18"))
+            .expect("topic must be valid");
+        let ads = vec![
+            DiscoveredTopicAd {
+                node: node(3),
+                ad: TopicAd {
+                    topic: "lattice.tracks.v1".to_owned(),
+                    partition: b"drone-17".to_vec(),
+                    roles: TopicRoles::SUBSCRIBE,
+                    head_seq: 0,
+                    tail_seq: 0,
+                },
+            },
+            DiscoveredTopicAd {
+                node: node(2),
+                ad: TopicAd {
+                    topic: "lattice.tracks.v1".to_owned(),
+                    partition: Vec::new(),
+                    roles: TopicRoles::SUBSCRIBE,
+                    head_seq: 0,
+                    tail_seq: 0,
+                },
+            },
+            DiscoveredTopicAd {
+                node: node(4),
+                ad: TopicAd {
+                    topic: "lattice.tracks.v1".to_owned(),
+                    partition: b"drone-17".to_vec(),
+                    roles: TopicRoles::PUBLISH,
+                    head_seq: 1,
+                    tail_seq: 0,
+                },
+            },
+        ];
+
+        let discovery = discovery_from_topic_ads(&ads);
+
+        assert_eq!(
+            discovery.subscribers(&exact),
+            [node(2), node(3)].into_iter().collect()
+        );
+        assert_eq!(
+            discovery.subscribers(&other),
+            [node(2)].into_iter().collect()
+        );
     }
 
     #[test]
@@ -1242,6 +1466,7 @@ mod tests {
             seq: 1,
             ttl_sec: 300,
             adjacencies: Vec::new(),
+            topics: Vec::new(),
             epoch: 1,
         };
         let signed = proto::SignedLsa {
@@ -1253,6 +1478,33 @@ mod tests {
         assert!(matches!(
             decode_control_frame(frame),
             Err(RuntimeError::InvalidNodeIdLength(31))
+        ));
+
+        let invalid_topic = proto::Lsa {
+            origin: node(1).as_bytes().to_vec(),
+            seq: 1,
+            ttl_sec: 300,
+            adjacencies: Vec::new(),
+            topics: vec![proto::TopicAd {
+                topic: "lattice.tracks.v1".to_owned(),
+                partition: Vec::new(),
+                role: 0,
+                head_seq: 0,
+                tail_seq: 0,
+            }],
+            epoch: 1,
+        };
+        let frame = WireFrame::control(
+            FrameType::Lsa,
+            proto::SignedLsa {
+                lsa_bytes: invalid_topic.encode_to_vec(),
+                signature: Vec::new(),
+            }
+            .encode_to_vec(),
+        );
+        assert!(matches!(
+            decode_control_frame(frame),
+            Err(RuntimeError::InvalidTopicRole(0))
         ));
     }
 
@@ -1300,6 +1552,7 @@ mod tests {
                 seq: 1,
                 ttl_sec: 0,
                 adjacencies: Vec::new(),
+                topics: Vec::new(),
             },
             canonical_bytes: Arc::from([]),
             signature: Arc::from([]),
@@ -1307,6 +1560,33 @@ mod tests {
         assert!(matches!(
             encode_control_frame(&invalid_ttl),
             Err(RuntimeError::InvalidLsaTtl(0))
+        ));
+
+        let topic = TopicAd {
+            topic: "lattice.tracks.v1".to_owned(),
+            partition: Vec::new(),
+            roles: TopicRoles::SUBSCRIBE,
+            head_seq: 0,
+            tail_seq: 0,
+        };
+        let oversized_topics = ControlFrame::Lsa(LsaMessage {
+            lsa: Lsa {
+                origin: node(1),
+                epoch: 1,
+                seq: 1,
+                ttl_sec: 300,
+                adjacencies: Vec::new(),
+                topics: vec![topic; MAX_LSA_TOPIC_ADS + 1],
+            },
+            canonical_bytes: Arc::from([]),
+            signature: Arc::from([]),
+        });
+        assert!(matches!(
+            encode_control_frame(&oversized_topics),
+            Err(RuntimeError::TooManyElements {
+                field: "Lsa.topics",
+                ..
+            })
         ));
     }
 
